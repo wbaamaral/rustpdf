@@ -1,0 +1,36 @@
+# Gerado por packaging/package.sh — pacote Arch/Manjaro compilado do código-fonte.
+pkgname=rustpdf
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Editor de PDF em Rust (GTK 3, qpdf, Poppler)"
+arch=('x86_64')
+url="@URL@"
+license=('@LICENSE@')
+depends=('gtk3' 'qpdf' 'poppler' 'libjpeg-turbo' 'zlib' 'cairo' 'gdk-pixbuf2' 'glib2' 'hicolor-icon-theme')
+optdepends=('tesseract: OCR'
+            'tesseract-data-por: OCR em português'
+            'openssl: assinatura digital (em desenvolvimento)')
+makedepends=('cargo')
+source=("rustpdf-@VERSION@.tar.gz")
+sha256sums=('@SHA256@')
+
+build() {
+    cd "rustpdf-$pkgver"
+    cargo build --release --offline
+}
+
+check() {
+    cd "rustpdf-$pkgver"
+    cargo test --release --offline
+}
+
+package() {
+    cd "rustpdf-$pkgver"
+    install -Dm755 target/release/rustpdf "$pkgdir/usr/bin/rustpdf"
+    install -Dm755 target/release/rustpdf-cli "$pkgdir/usr/bin/rustpdf-cli"
+    install -Dm644 packaging/linux/rustpdf.desktop "$pkgdir/usr/share/applications/rustpdf.desktop"
+    install -Dm644 packaging/rustpdf.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/rustpdf.svg"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/rustpdf/README.md"
+    install -Dm644 TERCEIROS.md "$pkgdir/usr/share/doc/rustpdf/TERCEIROS.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/rustpdf/LICENSE"
+}

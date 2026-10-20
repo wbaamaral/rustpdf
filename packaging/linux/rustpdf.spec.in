@@ -1,0 +1,28 @@
+# Gerado por packaging/package.sh — RPM binário a partir dos arquivos já compilados.
+Name:           rustpdf
+Version:        @VERSION@
+Release:        1
+Summary:        Editor de PDF em Rust (GTK 3, qpdf, Poppler)
+License:        @LICENSE@
+URL:            @URL@
+BuildArch:      x86_64
+AutoReqProv:    no
+Requires:       gtk3, qpdf-libs, poppler-utils, libjpeg-turbo, zlib
+Recommends:     tesseract
+
+%description
+Editor de PDF com interface GTK 3: páginas, anotações, formulários AcroForm,
+edição de texto e imagens existentes, OCR e criptografia preservada.
+
+%install
+mkdir -p %{buildroot}
+cp -a @STAGE@/. %{buildroot}/
+
+%files
+/usr/bin/rustpdf
+/usr/bin/rustpdf-cli
+/usr/share/applications/rustpdf.desktop
+/usr/share/icons/hicolor/scalable/apps/rustpdf.svg
+%doc /usr/share/doc/rustpdf/README.md
+%doc /usr/share/doc/rustpdf/TERCEIROS.md
+%license /usr/share/licenses/rustpdf/LICENSE

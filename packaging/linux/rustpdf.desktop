@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=RustPDF
+GenericName=Editor de PDF
+Comment=Editar, anotar, preencher e reorganizar documentos PDF
+Exec=rustpdf %f
+Icon=rustpdf
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+Keywords=pdf;editor;anotação;formulário;ocr;
+StartupNotify=true

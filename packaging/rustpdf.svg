@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- Ícone do aplicativo RustPDF: folha com dobra, faixa "PDF" e caneta. Desenho original. -->
+  <defs>
+    <linearGradient id="sheet" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e6e9ee"/>
+    </linearGradient>
+    <linearGradient id="band" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#c8402a"/>
+      <stop offset="1" stop-color="#e2582f"/>
+    </linearGradient>
+  </defs>
+  <path d="M58 20h104l50 50v158a8 8 0 0 1-8 8H58a8 8 0 0 1-8-8V28a8 8 0 0 1 8-8z" fill="#1f2937" opacity=".25" transform="translate(4 6)"/>
+  <path d="M58 20h104l50 50v158a8 8 0 0 1-8 8H58a8 8 0 0 1-8-8V28a8 8 0 0 1 8-8z" fill="url(#sheet)" stroke="#9aa3ae" stroke-width="3"/>
+  <path d="M162 20v42a8 8 0 0 0 8 8h42z" fill="#cfd5dd" stroke="#9aa3ae" stroke-width="3" stroke-linejoin="round"/>
+  <g fill="#9aa3ae">
+    <rect x="76" y="92" width="96" height="9" rx="4.5"/>
+    <rect x="76" y="112" width="112" height="9" rx="4.5"/>
+    <rect x="76" y="132" width="72" height="9" rx="4.5"/>
+  </g>
+  <rect x="34" y="160" width="152" height="56" rx="10" fill="url(#band)"/>
+  <text x="110" y="201" font-family="DejaVu Sans, Arial, sans-serif" font-size="38" font-weight="700" fill="#fff" text-anchor="middle" letter-spacing="2">PDF</text>
+  <g transform="rotate(45 196 150)">
+    <rect x="184" y="76" width="24" height="112" rx="5" fill="#f59e0b" stroke="#92400e" stroke-width="3"/>
+    <rect x="184" y="76" width="24" height="18" rx="5" fill="#fcd34d" stroke="#92400e" stroke-width="3"/>
+    <path d="M184 188h24l-12 26z" fill="#fde68a" stroke="#92400e" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M191.5 203.5l9 0-4.5 10.5z" fill="#1f2937"/>
+  </g>
+</svg>

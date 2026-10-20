@@ -1,0 +1,12 @@
+Package: rustpdf
+Version: @VERSION@-1
+Section: graphics
+Priority: optional
+Architecture: amd64
+Maintainer: @MAINTAINER@
+Depends: libgtk-3-0, qpdf, poppler-utils, libturbojpeg0 | libturbojpeg, zlib1g, libcairo2, libgdk-pixbuf-2.0-0 | libgdk-pixbuf2.0-0
+Recommends: tesseract-ocr
+Homepage: @URL@
+Description: Editor de PDF em Rust (GTK 3, qpdf, Poppler)
+ Páginas, anotações, formulários AcroForm, edição de texto e imagens
+ existentes, OCR e criptografia preservada ao salvar.
