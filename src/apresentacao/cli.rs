@@ -2,7 +2,7 @@
 //! Argumentos da CLI → comandos, sem executar nada.
 use std::path::PathBuf;
 
-pub const EXPORT_USAGE: &str = "Uso: rustpdf-cli export ENTRADA.pdf SAIDA.{md,docx,pptx,csv,xlsx} [--paginas 1-3,7] [--sem-imagens] [--quebrar-paginas] [--fiel] [--ocr IDIOMA] [--separador ;] [--sem-bom]";
+pub const EXPORT_USAGE: &str = "Uso: rustpdf-cli export ENTRADA.pdf SAIDA.{md,docx,pptx,csv,xlsx} [--paginas 1-3,7] [--para-ia] [--sem-imagens] [--quebrar-paginas] [--fiel] [--ocr IDIOMA] [--separador ;] [--sem-bom]";
 
 pub use crate::app::exportar::{ExportFormat, ExportRequest};
 
@@ -56,6 +56,13 @@ pub fn parse_export(args: &[String]) -> Result<ExportCommand, String> {
                     return Err("--fiel só vale para .pptx".into());
                 }
                 command.faithful = true;
+            }
+            "--para-ia" | "--ai" => {
+                if format != ExportFormat::Markdown {
+                    return Err("--para-ia só vale para .md".into());
+                }
+                command.ai_optimized = true;
+                command.images = false;
             }
             "--sem-imagens" => {
                 if !matches!(format, ExportFormat::Markdown | ExportFormat::Docx) {
@@ -214,6 +221,21 @@ mod tests {
         assert_eq!(
             parse_export(&args(&["a.pdf", "b.md", "--ocr", "p;rm"])).unwrap_err(),
             "--ocr precisa do idioma do Tesseract (ex.: por, eng, por+eng)"
+        );
+    }
+
+    #[test]
+    fn ai_optimization_option_in_cli() {
+        let command = parse_export(&args(&["a.pdf", "b.md", "--para-ia"])).unwrap();
+        assert!(command.request.ai_optimized);
+        assert!(!command.request.images);
+
+        let command_alias = parse_export(&args(&["a.pdf", "b.md", "--ai"])).unwrap();
+        assert!(command_alias.request.ai_optimized);
+
+        assert_eq!(
+            parse_export(&args(&["a.pdf", "b.docx", "--para-ia"])).unwrap_err(),
+            "--para-ia só vale para .md"
         );
     }
 }

@@ -36,6 +36,11 @@ pub fn question(format: ExportFormat) -> Option<&'static str> {
     }
 }
 
+/// Pergunta para otimização da exportação para consumo por agentes de IA.
+pub fn ai_question() -> &'static str {
+    "Otimizar a exportação para consumo por agentes de IA (remover ruídos, cabeçalhos repetidos e imagens)?"
+}
+
 /// Pedido com as páginas digitadas (vazio = todas), validadas contra
 /// `total`, e a resposta à [`question`] do formato.
 pub fn request(
@@ -124,6 +129,7 @@ mod tests {
             Some("Incluir as imagens das páginas?")
         );
         assert_eq!(question(ExportFormat::Csv), None);
+        assert!(ai_question().contains("agentes de IA"));
     }
 
     #[test]

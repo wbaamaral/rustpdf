@@ -10,10 +10,26 @@ pub struct Markdown {
     pub images: Vec<(String, Vec<u8>)>,
 }
 
+/// Opções de renderização do Markdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MarkdownOptions {
+    /// Modo otimizado para consumo por agentes de IA: evita escape excessivo de caracteres comuns.
+    pub ai_mode: bool,
+}
+
 /// Markdown do documento: blocos separados por linha em branco, itens de
 /// lista consecutivos juntos; termina com uma quebra de linha. As imagens
 /// ficam em `images_folder` (`p<página>-i<n>.png`), ao lado do arquivo.
 pub fn render(document: &Document, images_folder: &str) -> Markdown {
+    render_with_options(document, images_folder, &MarkdownOptions::default())
+}
+
+/// Como [`render`], aplicando as opções especificadas.
+pub fn render_with_options(
+    document: &Document,
+    images_folder: &str,
+    options: &MarkdownOptions,
+) -> Markdown {
     let mut text = String::new();
     let mut images = Vec::new();
     let mut previous_was_item = false;
@@ -40,7 +56,7 @@ pub fn render(document: &Document, images_folder: &str) -> Markdown {
                     text.push_str(&format!("![Imagem da página {}]({target})", page.number));
                     images.push((path, png.clone()));
                 }
-                _ => text.push_str(&block_markdown(block)),
+                _ => text.push_str(&block_markdown(block, options)),
             }
             previous_was_item = is_item;
         }
@@ -51,41 +67,69 @@ pub fn render(document: &Document, images_folder: &str) -> Markdown {
     Markdown { text, images }
 }
 
-fn block_markdown(block: &Block) -> String {
+fn block_markdown(block: &Block, options: &MarkdownOptions) -> String {
     match block {
-        Block::Table { rows } => table_markdown(rows),
+        Block::Table { rows } => table_markdown(rows, options),
         Block::Image { .. } => String::new(), // tratada em `render`
         Block::Heading { level, text } => {
+            let rendered_text = if options.ai_mode {
+                text.trim().to_string()
+            } else {
+                escape_inline(text)
+            };
             format!(
                 "{} {}",
                 "#".repeat(usize::from(*level).clamp(1, 6)),
-                escape_inline(text)
+                rendered_text
             )
         }
-        Block::Paragraph { text } => escape(text),
+        Block::Paragraph { text } => {
+            if options.ai_mode {
+                text.to_string()
+            } else {
+                escape(text)
+            }
+        }
         Block::ListItem {
             marker,
             level,
             text,
         } => {
             let indent = "    ".repeat(usize::from(*level));
-            let text = escape(text);
+            let text = if options.ai_mode {
+                text.to_string()
+            } else {
+                escape(text)
+            };
             match numbered(marker) {
                 Some(number) => format!("{indent}{number}. {text}"),
                 None if marker.is_empty() => format!("{indent}- {text}"),
-                None => format!("{indent}- {} {text}", escape_inline(marker)),
+                None => {
+                    let m = if options.ai_mode {
+                        marker.to_string()
+                    } else {
+                        escape_inline(marker)
+                    };
+                    format!("{indent}- {m} {text}")
+                }
             }
         }
     }
 }
 
 /// Tabela GFM com as colunas alinhadas; a primeira linha é o cabeçalho.
-fn table_markdown(rows: &[Vec<String>]) -> String {
+fn table_markdown(rows: &[Vec<String>], options: &MarkdownOptions) -> String {
     let cells: Vec<Vec<String>> = rows
         .iter()
         .map(|row| {
             row.iter()
-                .map(|cell| escape_inline(cell).replace('|', "\\|"))
+                .map(|cell| {
+                    if options.ai_mode {
+                        cell.replace('|', "\\|")
+                    } else {
+                        escape_inline(cell).replace('|', "\\|")
+                    }
+                })
                 .collect()
         })
         .collect();
@@ -304,6 +348,36 @@ mod tests {
                 .contains("](<meu relatório_arquivos/p2-i1.png>)"),
             "{}",
             spaced.text
+        );
+    }
+
+    #[test]
+    fn ai_mode_avoids_over_escaping() {
+        let doc = document(vec![vec![
+            Block::Heading {
+                level: 2,
+                text: "Seção [1]: Variáveis".into(),
+            },
+            Block::Paragraph {
+                text: "Referência [1] descreve _variáveis_ com *ênfase* e `código` <sem-escape>."
+                    .into(),
+            },
+            Block::Table {
+                rows: vec![
+                    vec!["Item [A]".into(), "Nota".into()],
+                    vec!["Teste | pipe".into(), "100%".into()],
+                ],
+            },
+        ]]);
+
+        let ai_markdown = render_with_options(&doc, "img", &MarkdownOptions { ai_mode: true });
+        assert_eq!(
+            ai_markdown.text,
+            "## Seção [1]: Variáveis\n\n\
+Referência [1] descreve _variáveis_ com *ênfase* e `código` <sem-escape>.\n\n\
+| Item [A]      | Nota |\n\
+| ------------- | ---- |\n\
+| Teste \\| pipe | 100% |\n"
         );
     }
 }

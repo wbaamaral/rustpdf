@@ -10,8 +10,22 @@ use std::collections::{BTreeMap, HashSet};
 
 /// Uma linha a partir desta proporção da altura do corpo é candidata a título.
 const HEADING_RATIO: f64 = 1.2;
-/// Marcadores gráficos de lista.
-const BULLETS: &[&str] = &["•", "◦", "▪", "▫", "‣", "●", "○", "■", "-", "–", "—", "*"];
+/// Marcadores gráficos de lista (inclui símbolos comuns como U+F0B7 do Word/Wingdings).
+const BULLETS: &[&str] = &[
+    "•", "◦", "▪", "▫", "‣", "●", "○", "■", "-", "–", "—", "*", "·", "\u{f0b7}", "\u{f0a7}",
+    "\u{f0d8}", "\u{f0fc}",
+];
+
+/// Verifica se a palavra é um marcador gráfico de lista.
+pub(super) fn is_graphic_bullet(word: &str) -> bool {
+    BULLETS.contains(&word) || {
+        let mut chars = word.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => (0xF000..=0xF0FF).contains(&(c as u32)),
+            _ => false,
+        }
+    }
+}
 
 /// Blocos de conteúdo da página, na ordem de leitura do layout.
 pub fn structure(page: &Page) -> Vec<Block> {
@@ -70,7 +84,7 @@ fn groups(page: &Page, body: f64, segments: &[Segment]) -> Vec<(f64, Group)> {
                 groups.push((table.top, Group::Table(table.rows.clone())));
             }
         }
-        let lines: Vec<TextLine> = layout_block
+        let mut lines: Vec<TextLine> = layout_block
             .lines
             .iter()
             .enumerate()
@@ -91,6 +105,10 @@ fn groups(page: &Page, body: f64, segments: &[Segment]) -> Vec<(f64, Group)> {
         if let Some((_, Group::Lines(previous))) = groups.last_mut() {
             if continues_heading_line(previous, &lines, body) {
                 previous[0].words.extend(lines[0].words.iter().cloned());
+                continue;
+            }
+            if merges_bullet_column(previous, &mut lines) {
+                *previous = lines;
                 continue;
             }
         }
@@ -133,7 +151,7 @@ impl TextLine {
     /// `Some("1.")` etc. para rótulos.
     fn marker(&self) -> Option<String> {
         let first = self.words.first()?;
-        if BULLETS.contains(&first.as_str()) {
+        if is_graphic_bullet(first) {
             Some(String::new())
         } else if is_label(first) {
             Some(first.clone())
@@ -145,7 +163,7 @@ impl TextLine {
 
 /// Marcador de lista: gráfico (•, –, *) ou rótulo (`1.`, `a)`, `iv.`).
 pub(super) fn is_list_marker(word: &str) -> bool {
-    BULLETS.contains(&word) || is_label(word)
+    is_graphic_bullet(word) || is_label(word)
 }
 
 /// `1.`, `12)`, `a.`, `B)`, `iv.` — números de até 3 dígitos, uma letra ou
@@ -212,7 +230,7 @@ fn continues_heading_line(previous: &[TextLine], next: &[TextLine], body: f64) -
         && after.left > before.left
 }
 
-/// Junta um rótulo sozinho na linha ("3.") ao texto da linha seguinte.
+/// Junta um marcador sozinho na linha ("3." ou "•") ao texto da linha seguinte.
 fn merge_loose_markers(lines: Vec<TextLine>) -> Vec<TextLine> {
     let mut merged: Vec<TextLine> = Vec::new();
     let mut pending: Option<TextLine> = None;
@@ -223,7 +241,7 @@ fn merge_loose_markers(lines: Vec<TextLine>) -> Vec<TextLine> {
             merged.push(marker);
             continue;
         }
-        if line.words.len() == 1 && line.marker().is_some_and(|m| !m.is_empty()) {
+        if line.words.len() == 1 && line.marker().is_some() {
             pending = Some(line);
         } else {
             merged.push(line);
@@ -231,6 +249,50 @@ fn merge_loose_markers(lines: Vec<TextLine>) -> Vec<TextLine> {
     }
     merged.extend(pending);
     merged
+}
+
+/// O bloco `previous` é uma coluna contendo apenas marcadores de lista
+/// (ex.: Word separando os marcadores das linhas de texto em dois blocos).
+/// Se suas linhas se alinham verticalmente com as linhas de `next`, insere
+/// cada marcador no início da respectiva linha de texto.
+fn merges_bullet_column(previous: &[TextLine], next: &mut [TextLine]) -> bool {
+    if previous.is_empty() || next.is_empty() {
+        return false;
+    }
+    let is_all_bullets = previous
+        .iter()
+        .all(|l| l.words.len() == 1 && is_graphic_bullet(&l.words[0]));
+    if !is_all_bullets {
+        return false;
+    }
+
+    let mut matched = Vec::with_capacity(previous.len());
+    let mut last_idx = 0;
+    for bullet in previous {
+        let mut found = None;
+        for (idx, line) in next.iter().enumerate().skip(last_idx) {
+            let aligned = (line.top - bullet.top).abs() <= line.height * 1.0;
+            let to_right = line.left > bullet.left;
+            if aligned && to_right {
+                found = Some(idx);
+                last_idx = idx + 1;
+                break;
+            }
+        }
+        if let Some(idx) = found {
+            matched.push((bullet.words[0].clone(), idx));
+        } else {
+            return false;
+        }
+    }
+
+    for (marker, idx) in matched {
+        next[idx].words.insert(0, marker);
+        if let Some(b) = previous.iter().find(|b| b.words[0] == next[idx].words[0]) {
+            next[idx].left = b.left;
+        }
+    }
+    true
 }
 
 /// Bloco curto (até 2 linhas), sem lista, com linhas maiores que o corpo.
@@ -579,6 +641,48 @@ mod tests {
         assert_eq!(
             structure_with(&page(vec![]), vec![image(10.0, 3)], &[]),
             [picture(3)]
+        );
+    }
+
+    #[test]
+    fn bullet_column_before_text_block_merges_into_list_items() {
+        let bullets = vec![
+            line("•", 50.0, 100.0, 12.0),
+            line("•", 50.0, 120.0, 12.0),
+            line("•", 50.0, 140.0, 12.0),
+        ];
+        let texts = vec![
+            line("Item um", 70.0, 100.5, 12.0),
+            line("Item dois", 70.0, 120.5, 12.0),
+            line("Item três", 70.0, 140.5, 12.0),
+        ];
+        let layout = page(vec![bullets, texts]);
+        let item = |text: &str| Block::ListItem {
+            marker: "".into(),
+            level: 0,
+            text: text.into(),
+        };
+        assert_eq!(
+            structure(&layout),
+            [item("Item um"), item("Item dois"), item("Item três")]
+        );
+    }
+
+    #[test]
+    fn wingdings_bullet_f0b7_is_recognized_as_list_item() {
+        let layout = page(vec![vec![line(
+            "\u{f0b7} Item com marcador Wingdings",
+            72.0,
+            100.0,
+            12.0,
+        )]]);
+        assert_eq!(
+            structure(&layout),
+            [Block::ListItem {
+                marker: "".into(),
+                level: 0,
+                text: "Item com marcador Wingdings".into()
+            }]
         );
     }
 }

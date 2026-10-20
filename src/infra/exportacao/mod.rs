@@ -44,9 +44,10 @@ pub fn export_to_files(
     if let Some(language) = request.ocr.as_deref() {
         sources = sources.with_ocr(&Tesseract, language);
     }
-    let with_images = request.format == ExportFormat::Pptx
+    let with_images = (request.format == ExportFormat::Pptx
         || (request.images
-            && matches!(request.format, ExportFormat::Markdown | ExportFormat::Docx));
+            && matches!(request.format, ExportFormat::Markdown | ExportFormat::Docx)))
+        && !request.ai_optimized;
     if with_images {
         sources = sources.with_images(&PdfImages);
     }
@@ -55,7 +56,13 @@ pub fn export_to_files(
         write(output, &pptx::render(&slides)?)?;
         return Ok(written);
     }
-    let document = extract(&sources, pdf, &pages)?;
+    let mut document = extract(&sources, pdf, &pages)?;
+    if request.ai_optimized {
+        document = crate::dominio::exportacao::ia::optimize_for_ai(
+            &document,
+            &crate::dominio::exportacao::ia::AiOptimizationOptions::default(),
+        );
+    }
     match request.format {
         ExportFormat::Markdown => {
             // Imagens em "<nome>_arquivos/", ao lado do .md.
@@ -63,7 +70,11 @@ pub fn export_to_files(
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let rendered = markdown::render(&document, &format!("{stem}_arquivos"));
+            let options = markdown::MarkdownOptions {
+                ai_mode: request.ai_optimized,
+            };
+            let rendered =
+                markdown::render_with_options(&document, &format!("{stem}_arquivos"), &options);
             let base = output.parent().unwrap_or(Path::new(""));
             for (relative, png) in &rendered.images {
                 let path = base.join(relative);

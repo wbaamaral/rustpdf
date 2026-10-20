@@ -335,6 +335,44 @@ fn export_markdown_keeps_headings_paragraphs_and_lists() {
 }
 
 #[test]
+fn export_markdown_with_ai_optimization() {
+    let dir = workspace("export-md-ai");
+    let root = dir.path();
+    let input = path(root, "documento.pdf");
+    let mut pdf = PdfBuilder::new();
+    pdf.text_page(&[
+        (72.0, 780.0, 12.0, "Manual do Sistema"),
+        (72.0, 700.0, 12.0, "O processo garante alta disponi-"),
+        (72.0, 50.0, 12.0, "Pagina 1 de 2"),
+    ]);
+    pdf.text_page(&[
+        (72.0, 780.0, 12.0, "Manual do Sistema"),
+        (72.0, 700.0, 12.0, "bilidade e baixa latencia."),
+        (72.0, 50.0, 12.0, "Pagina 2 de 2"),
+    ]);
+    pdf.write(Path::new(&input));
+
+    let output = path(root, "otimizado.md");
+    ok(&["export", &input, &output, "--para-ia"]);
+
+    let content = fs::read_to_string(&output).unwrap();
+    // Cabeçalho da primeira página é mantido (título), mas não é repetido na segunda
+    assert!(content.contains("Manual do Sistema"));
+    assert_eq!(
+        content.matches("Manual do Sistema").count(),
+        1,
+        "cabeçalho repetido não deve aparecer na segunda página"
+    );
+    // Números de página devem ter sido removidos
+    assert!(!content.contains("Pagina 1 de 2"));
+    assert!(!content.contains("Pagina 2 de 2"));
+    // Parágrafo partido por hífen deve ser unificado
+    assert!(content.contains("O processo garante alta disponibilidade e baixa latencia."));
+    // Nenhuma pasta de imagens foi criada
+    assert!(!Path::new(&path(root, "otimizado_arquivos")).exists());
+}
+
+#[test]
 fn export_csv_writes_each_table() {
     let dir = workspace("export-csv");
     let root = dir.path();
@@ -636,7 +674,9 @@ fn export_reads_scanned_pages_with_ocr() {
     );
     ok(&["export", &scanned, &output, "--sem-imagens", "--ocr", "eng"]);
     let text = fs::read_to_string(&output).unwrap();
-    assert!(text.contains("RUSTPDF") && text.contains("OCR"), "{text}");
+    // O OCR pode errar letras de nomes em maiúsculas (o Tesseract do Ubuntu
+    // 24.04 lê "RUSTPDE"); palavras comuns saem estáveis.
+    assert!(text.contains("testa") && text.contains("aqui"), "{text}");
 }
 
 #[test]

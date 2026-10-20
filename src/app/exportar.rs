@@ -91,6 +91,8 @@ pub struct ExportRequest {
     pub bom: bool,
     /// Idioma do OCR para páginas sem texto (`None` = sem OCR).
     pub ocr: Option<String>,
+    /// Otimizar a exportação para consumo por agentes de IA (remove ruídos, cabeçalhos repetidos e formatação excessiva).
+    pub ai_optimized: bool,
 }
 
 impl ExportRequest {
@@ -106,6 +108,7 @@ impl ExportRequest {
             separator: ';',
             bom: true,
             ocr: None,
+            ai_optimized: false,
         }
     }
 }

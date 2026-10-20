@@ -706,7 +706,11 @@ fn export_document(format: ExportFormat) -> AppResult<()> {
     };
     let answer = exportacao::question(format).is_some_and(confirm);
     let total = with_session(|s| Ok(s.pages))?;
-    let request = exportacao::request(output, format, &pages, answer, total)?;
+    let mut request = exportacao::request(output, format, &pages, answer, total)?;
+    if format == ExportFormat::Markdown && confirm(exportacao::ai_question()) {
+        request.ai_optimized = true;
+        request.images = false;
+    }
     let snapshot = with_session(|s| s.export_snapshot())?;
     shell::start_export(snapshot, total, request);
     status(&format!("Exportando para {}…", format.label()));

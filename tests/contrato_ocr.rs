@@ -21,6 +21,8 @@ fn scanned_page(dir: &TempDir) -> PathBuf {
     png
 }
 
+/// Confere palavras comuns: o OCR pode errar letras de nomes em maiúsculas
+/// (o Tesseract do Ubuntu 24.04 lê "RUSTPDF" como "RUSTPDE").
 fn contract(ocr: &impl OcrEngine, image: &Path) {
     let (width, height) = png::file_dimensions(image).unwrap();
     let image = &std::fs::read(image).unwrap();
@@ -31,15 +33,15 @@ fn contract(ocr: &impl OcrEngine, image: &Path) {
     );
     let word = page
         .words()
-        .find(|word| word.text == "RUSTPDF")
-        .expect("palavra RUSTPDF");
+        .find(|word| word.text == "testa")
+        .expect("palavra testa");
     assert!(word.rect.left() >= 0.0 && word.rect.right() <= page.width);
     assert!(word.rect.top() >= 0.0 && word.rect.bottom() <= page.height);
     assert!(
         word.rect.top() < page.height / 2.0,
         "a primeira linha fica no alto"
     );
-    assert!(ocr.text(image, Some("eng")).unwrap().contains("RUSTPDF"));
+    assert!(ocr.text(image, Some("eng")).unwrap().contains("testa"));
     assert!(ocr.words(b"isto nao e um PNG", "eng").is_err());
 }
 
