@@ -100,6 +100,14 @@ RUSTPDF_WIN_SYSROOT=/caminho/para/mingw64 packaging/package.sh windows
 O `makensis` do Linux (pacote `nsis`) gera o instalador; sem ele, sai só o
 `.zip`.
 
+## Releases no GitHub
+
+O workflow `.github/workflows/release.yml` gera todos os pacotes em máquinas
+do GitHub e os publica na página de Releases a cada tag `v<versão>`: `.tar.gz`
+e `.deb` (Ubuntu), `.pkg.tar.zst` (contêiner Arch), `.rpm` (contêiner Fedora),
+`.zip` e instalador (Windows com MSYS2), com `SHA256SUMS`. Para refazer os
+pacotes de uma versão já publicada: Actions › Release › Run workflow.
+
 ## Estado da verificação
 
 - Linux: `.tar.gz`, Arch (makepkg + namcap) e `.rpm` gerados e inspecionados no

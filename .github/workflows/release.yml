@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Gera os pacotes do RustPDF e os publica na página de Releases.
+#
+# - Automático: ao enviar uma tag v<versão> (ex.: v0.0.3).
+# - Manual: Actions › Release › Run workflow, informando uma tag existente
+#   (anexa os pacotes a uma release já criada) ou deixando a tag em branco
+#   para um teste: gera os pacotes do main como artefatos, sem release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag existente (ex.: v0.0.2); em branco = teste com o main, sem release"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  # Tag da release, ou vazio no teste manual (usa o main e não publica).
+  TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  REF: ${{ github.event_name == 'push' && github.ref_name || (inputs.tag != '' && inputs.tag || github.sha) }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Versão da tag
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.REF }}
+      - id: version
+        name: Tag e Cargo.toml devem ter a mesma versão
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ -z "$TAG" ]; then
+            echo "Teste manual: pacotes da versão $version (main), sem release"
+          elif [ "v$version" != "$TAG" ]; then
+            echo "::error::A tag $TAG não corresponde à versão $version do Cargo.toml"
+            exit 1
+          fi
+
+  linux-ubuntu:
+    name: Linux portátil e .deb (Ubuntu)
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.REF }}
+      - name: Dependências
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libqpdf-dev libturbojpeg0-dev zlib1g-dev \
+            poppler-utils qpdf tesseract-ocr tesseract-ocr-eng \
+            desktop-file-utils file
+      - name: Testes
+        run: cargo test --release --offline
+      - name: Pacotes
+        run: packaging/package.sh linux --skip-tests --formats tar,deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-ubuntu
+          path: |
+            dist/packages/*.tar.gz
+            dist/packages/*.deb
+          if-no-files-found: error
+
+  linux-arch:
+    name: Arch Linux (.pkg.tar.zst)
+    needs: check
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Dependências
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust gtk3 qpdf poppler \
+            libjpeg-turbo zlib tesseract tesseract-data-eng namcap
+          useradd -m builder
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.REF }}
+      - name: Pacote (makepkg não roda como root)
+        run: |
+          chown -R builder: "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE' && packaging/package.sh linux --formats arch"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arch
+          path: |
+            dist/packages/*.pkg.tar*
+            dist/packages/arch/PKGBUILD
+          if-no-files-found: error
+
+  linux-fedora:
+    name: Fedora (.rpm)
+    needs: check
+    runs-on: ubuntu-24.04
+    container: fedora:latest
+    steps:
+      - name: Dependências
+        run: |
+          dnf install -y git rust cargo gcc gtk3-devel qpdf-devel turbojpeg-devel \
+            zlib-devel poppler-utils qpdf tesseract tesseract-langpack-eng \
+            rpm-build desktop-file-utils file findutils which
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.REF }}
+      - name: Testes
+        run: cargo test --release --offline
+      - name: Pacote
+        run: packaging/package.sh linux --skip-tests --formats rpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-fedora
+          path: dist/packages/*.rpm
+          if-no-files-found: error
+
+  windows:
+    name: Windows (.zip e instalador)
+    needs: check
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.REF }}
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git zip
+            mingw-w64-x86_64-rust
+            mingw-w64-x86_64-gtk3
+            mingw-w64-x86_64-librsvg
+            mingw-w64-x86_64-qpdf
+            mingw-w64-x86_64-poppler
+            mingw-w64-x86_64-libjpeg-turbo
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-tesseract-ocr
+            mingw-w64-x86_64-tesseract-data-eng
+            mingw-w64-x86_64-tesseract-data-por
+            mingw-w64-x86_64-nsis
+            mingw-w64-x86_64-imagemagick
+      - name: Testes
+        run: cargo test --release --offline
+      - name: Pacotes
+        run: packaging/package.sh windows --skip-tests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/packages/*.zip
+            dist/packages/*-setup.exe
+          if-no-files-found: error
+
+  release:
+    name: Publicar na página de Releases
+    needs: [check, linux-ubuntu, linux-arch, linux-fedora, windows]
+    if: ${{ github.event_name == 'push' || inputs.tag != '' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.REF }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Arquivos e somas SHA-256
+        run: |
+          mkdir release
+          find artifacts -type f ! -name PKGBUILD -exec cp {} release/ \;
+          cp artifacts/linux-arch/arch/PKGBUILD release/PKGBUILD
+          (cd release && sha256sum * > SHA256SUMS)
+          ls -la release
+      - name: Notas da versão
+        run: |
+          git fetch --force --tags origin
+          {
+            git tag -l --format='%(contents)' "$TAG" | sed '/^-----BEGIN/,$d'
+            echo
+            echo "## Pacotes"
+            echo
+            echo "| Sistema | Arquivo |"
+            echo "| --- | --- |"
+            echo "| Linux (qualquer distribuição, com instalador) | \`rustpdf-${{ needs.check.outputs.version }}-linux-x86_64.tar.gz\` |"
+            echo "| Debian / Ubuntu | \`rustpdf_${{ needs.check.outputs.version }}-1_amd64.deb\` |"
+            echo "| Arch / Manjaro | \`rustpdf-${{ needs.check.outputs.version }}-1-x86_64.pkg.tar.zst\` (ou o \`PKGBUILD\`) |"
+            echo "| Fedora | \`rustpdf-${{ needs.check.outputs.version }}-1.x86_64.rpm\` |"
+            echo "| Windows (portátil) | \`rustpdf-${{ needs.check.outputs.version }}-windows-x86_64.zip\` |"
+            echo "| Windows (instalador) | \`rustpdf-${{ needs.check.outputs.version }}-windows-x86_64-setup.exe\` |"
+            echo
+            echo "Confira com \`sha256sum -c SHA256SUMS\`. Licença AGPL-3.0-or-later; componentes de terceiros em \`TERCEIROS.md\`."
+          } > notes.md
+          cat notes.md
+      - name: Criar ou atualizar a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" release/* --title "RustPDF ${{ needs.check.outputs.version }}" --notes-file notes.md
+          fi

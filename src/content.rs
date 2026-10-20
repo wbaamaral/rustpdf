@@ -60,10 +60,16 @@ extern "C" {
         bufp: *mut *mut u8,
         len: *mut usize,
     ) -> c_int;
-    fn qpdf_oh_free_buffer(bufp: *mut *mut u8);
     fn qpdf_oh_begin_dict_key_iter(qpdf: *mut c_void, dict: u32);
     fn qpdf_oh_dict_more_keys(qpdf: *mut c_void) -> c_int;
     fn qpdf_oh_dict_next_key(qpdf: *mut c_void) -> *const c_char;
+}
+
+// Buffers de `qpdf_oh_get_stream_data`/`qpdf_oh_get_page_content_data` são
+// alocados com `malloc` e liberados com `free` (o `qpdf_oh_free_buffer` só
+// existe no qpdf 12; o Ubuntu 24.04 traz o 11.9).
+extern "C" {
+    fn free(pointer: *mut c_void);
 }
 
 struct Document(*mut c_void);
@@ -322,7 +328,7 @@ fn read_stream_data(doc: &Document, stream: u32) -> AppResult<Vec<u8>> {
         return Ok(Vec::new());
     }
     let data = unsafe { std::slice::from_raw_parts(buffer, length) }.to_vec();
-    unsafe { qpdf_oh_free_buffer(&mut buffer) };
+    unsafe { free(buffer.cast()) };
     Ok(data)
 }
 
@@ -334,7 +340,7 @@ fn read_page_content(doc: &Document, page: u32) -> AppResult<Vec<u8>> {
         return Ok(Vec::new());
     }
     let data = unsafe { std::slice::from_raw_parts(buffer, length) }.to_vec();
-    unsafe { qpdf_oh_free_buffer(&mut buffer) };
+    unsafe { free(buffer.cast()) };
     Ok(data)
 }
 

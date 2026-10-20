@@ -164,6 +164,54 @@ pub fn path_to_cstring(path: &Path) -> AppResult<std::ffi::CString> {
     std::ffi::CString::new(bytes).map_err(|_| "Caminho com byte NUL".into())
 }
 
+/// Caminho absoluto e canônico. No Windows, `fs::canonicalize` devolve a forma
+/// "verbatim" (`\\?\C:\…`), que programas externos como qpdf e Poppler
+/// (MinGW) não entendem: o prefixo é removido.
+pub fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+    if cfg!(windows) {
+        if let Some(text) = canonical.to_str() {
+            return Ok(PathBuf::from(strip_verbatim_prefix(text)));
+        }
+    }
+    Ok(canonical)
+}
+
+/// `\\?\C:\pasta` → `C:\pasta`; `\\?\UNC\servidor\x` → `\\servidor\x`.
+fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    match path.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_string(),
+        _ => path.to_string(),
+    }
+}
+
+/// Troca `to` por `from` (rename). No Windows, um arquivo recém-gravado pode
+/// ficar aberto por alguns milissegundos pelo antivírus ou pelo indexador, e
+/// a troca falha com "acesso negado" (erro 5) ou "em uso" (erro 32): nesses
+/// casos tenta de novo, com espera crescente, por até ~2 s.
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && attempt < 12
+                    && matches!(error.raw_os_error(), Some(5) | Some(32)) =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(
+                    10 * u64::from(attempt) * u64::from(attempt),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Cria um arquivo novo legível só pelo usuário (0600 no Unix; no Windows a
 /// pasta temporária do usuário já é privada).
 fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
@@ -283,7 +331,7 @@ fn run(program: &str, args: &[OsString]) -> AppResult<String> {
 }
 
 pub fn page_count(path: &Path) -> AppResult<usize> {
-    let path = fs::canonicalize(path).map_err(|e| format!("Arquivo inacessível: {e}"))?;
+    let path = absolute_path(path).map_err(|e| format!("Arquivo inacessível: {e}"))?;
     let output = run(
         "qpdf",
         &[OsString::from("--show-npages"), path.as_os_str().to_owned()],
@@ -354,7 +402,7 @@ pub fn render_thumbnails(
             continue;
         };
         let target = directory.join(format!("p-{number:05}.png"));
-        fs::rename(entry.path(), &target).map_err(|e| format!("Miniaturas: {e}"))?;
+        replace_file(&entry.path(), &target).map_err(|e| format!("Miniaturas: {e}"))?;
         produced.push((number, target));
     }
     Ok(produced)
@@ -495,7 +543,7 @@ impl PdfSession {
     }
 
     fn open_with_optional_password(source: &Path, password: Option<&str>) -> AppResult<Self> {
-        let source = fs::canonicalize(source).map_err(|e| format!("Arquivo inacessível: {e}"))?;
+        let source = absolute_path(source).map_err(|e| format!("Arquivo inacessível: {e}"))?;
         let encrypted_source = is_encrypted(&source)?;
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -770,7 +818,7 @@ impl PdfSession {
         let next = self.work_dir.join("next.pdf");
         let count = page_count(&next)?;
         let prior = self.snapshot("undo")?;
-        if let Err(error) = fs::rename(&next, &self.work) {
+        if let Err(error) = replace_file(&next, &self.work) {
             let _ = fs::remove_file(prior.path);
             return Err(format!("Atualização do PDF: {error}"));
         }
@@ -815,7 +863,7 @@ impl PdfSession {
                 return Err(error);
             }
         };
-        if let Err(error) = fs::rename(&restored, &self.work) {
+        if let Err(error) = replace_file(&restored, &self.work) {
             let _ = fs::remove_file(restored);
             let _ = fs::remove_file(current.path);
             return Err(format!("Restaurar PDF: {error}"));
@@ -847,7 +895,7 @@ impl PdfSession {
                 return Err(error);
             }
         };
-        if let Err(error) = fs::rename(&restored, &self.work) {
+        if let Err(error) = replace_file(&restored, &self.work) {
             let _ = fs::remove_file(restored);
             let _ = fs::remove_file(current.path);
             return Err(format!("Restaurar PDF: {error}"));
@@ -1864,7 +1912,7 @@ impl PdfSession {
     }
 
     pub fn append_pdf(&mut self, path: &Path) -> AppResult<()> {
-        let path = fs::canonicalize(path).map_err(|e| format!("Arquivo inacessível: {e}"))?;
+        let path = absolute_path(path).map_err(|e| format!("Arquivo inacessível: {e}"))?;
         page_count(&path)?;
         let next = self.work_dir.join("next.pdf");
         self.apply_qpdf(&[
@@ -2080,11 +2128,11 @@ impl PdfSession {
         } else {
             fs::copy(&self.work, &staged).map_err(|e| format!("Falha ao salvar: {e}"))?;
         }
-        if let Err(error) = fs::rename(&staged, destination) {
+        if let Err(error) = replace_file(&staged, destination) {
             let _ = fs::remove_file(&staged);
             return Err(format!("Falha ao substituir o destino: {error}"));
         }
-        self.source = fs::canonicalize(destination).unwrap_or_else(|_| destination.to_path_buf());
+        self.source = absolute_path(destination).unwrap_or_else(|_| destination.to_path_buf());
         self.encrypted_source = keep_encryption;
         self.saved_revision = Some(self.revision);
         self.update_dirty();
@@ -3647,5 +3695,22 @@ mod mouse_hit_tests {
         let after = session.page_dimensions().unwrap();
         assert_eq!((before.1, before.0), after);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_verbatim_paths_are_normalized() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\C:\Users\a\work.pdf"),
+            r"C:\Users\a\work.pdf"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\srv\share\x.pdf"),
+            r"\\srv\share\x.pdf"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\Volume{abc}\x"),
+            r"\\?\Volume{abc}\x"
+        );
+        assert_eq!(strip_verbatim_prefix("/tmp/x.pdf"), "/tmp/x.pdf");
     }
 }
