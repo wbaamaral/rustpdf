@@ -304,6 +304,21 @@ impl Drop for Trace {
     }
 }
 
+/// Processo de uma ferramenta externa (qpdf, poppler, tesseract). No Windows,
+/// sem `CREATE_NO_WINDOW` cada execução abre e fecha uma janela de console,
+/// porque o aplicativo gráfico não tem console para os filhos herdarem.
+pub fn tool_command(program: &str) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 pub fn tool_output(program: &str, args: &[&OsStr]) -> AppResult<String> {
     let _trace = trace(|| {
         let first = args
@@ -314,7 +329,7 @@ pub fn tool_output(program: &str, args: &[&OsStr]) -> AppResult<String> {
             .join(" ");
         format!("  processo {program} {first}")
     });
-    let output = Command::new(program)
+    let output = tool_command(program)
         .args(args)
         .output()
         .map_err(|e| format!("Não foi possível executar {program}: {e}"))?;
@@ -350,7 +365,7 @@ pub fn page_count(path: &Path) -> AppResult<usize> {
 }
 
 pub fn is_encrypted(path: &Path) -> AppResult<bool> {
-    let status = Command::new("qpdf")
+    let status = tool_command("qpdf")
         .arg("--is-encrypted")
         .arg(path)
         .status()

@@ -2155,7 +2155,7 @@ const LICENSE_AGPL_3_0_OR_LATER: c_int = 13;
 
 /// Primeira linha da saída de uma ferramenta (`stdout` ou `stderr`), ou "não encontrado".
 fn tool_version(program: &str, args: &[&str]) -> String {
-    std::process::Command::new(program)
+    rustpdf::tool_command(program)
         .args(args)
         .output()
         .ok()
