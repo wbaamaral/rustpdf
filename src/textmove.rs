@@ -1139,6 +1139,135 @@ pub fn replace_run_text(
     Ok(out)
 }
 
+/// Unidade de texto selecionável: um operador (`Tj`/`TJ`/`'`/`"`) ou, quando o
+/// bloco `BT … ET` é desenhado letra a letra (um glifo por operador, como nos
+/// PDFs do Google Docs), o bloco inteiro — em geral uma palavra.
+#[derive(Debug, Clone)]
+pub struct TextUnit {
+    /// Operador que representa a unidade. Num bloco letra a letra é o primeiro,
+    /// marcado como não isolável: transformar move o bloco inteiro.
+    pub run: TextRunPlacement,
+    /// Bloco desenhado letra a letra.
+    pub block: bool,
+    /// Glifos (operadores) na unidade.
+    pub glyphs: usize,
+    /// Texto da unidade (bytes do operador; ilegível em fontes CID).
+    pub text: String,
+    /// Largura ao longo do texto, em pontos da página, quando as posições dos
+    /// glifos a determinam (bloco letra a letra).
+    pub width: Option<f64>,
+    /// Caixa aproximada `[x0, y0, x1, y1]` na página.
+    pub bounds: [f64; 4],
+}
+
+/// Um operador que mostra um só glifo (1 byte em fonte simples, 2 em CID).
+fn shows_single_glyph(run: &TextRunPlacement) -> bool {
+    run.text.chars().count() <= 2
+}
+
+/// Agrupa os operadores em unidades de texto (ver [`TextUnit`]).
+pub fn text_units(runs: &[TextRunPlacement]) -> Vec<TextUnit> {
+    let mut units = Vec::new();
+    let mut index = 0;
+    while index < runs.len() {
+        let first = &runs[index];
+        let mut end = index + 1;
+        if first.block.is_some() {
+            while end < runs.len()
+                && runs[end].stream == first.stream
+                && runs[end].block == first.block
+            {
+                end += 1;
+            }
+        }
+        let group = &runs[index..end];
+        if group.len() > 1 && group.iter().all(shows_single_glyph) {
+            let mut run = first.clone();
+            run.isolatable = false;
+            let trm = first.text_rendering_matrix();
+            let em = trm[0].hypot(trm[1]).max(1e-9);
+            let direction = (trm[0] / em, trm[1] / em);
+            // Extensão pelas origens exatas dos glifos (posições dos Td) + o último.
+            let projections: Vec<f64> = group
+                .iter()
+                .map(|glyph| {
+                    let origin = glyph.text_rendering_matrix();
+                    (origin[4] - trm[4]) * direction.0 + (origin[5] - trm[5]) * direction.1
+                })
+                .collect();
+            let start = projections
+                .iter()
+                .copied()
+                .fold(f64::MAX, f64::min)
+                .min(0.0);
+            let end_projection = projections.iter().copied().fold(f64::MIN, f64::max);
+            let width = end_projection - start + 0.6 * em;
+            let mut bounds = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+            for glyph in group {
+                let [x0, y0, x1, y1] = glyph.approximate_box();
+                bounds = [
+                    bounds[0].min(x0),
+                    bounds[1].min(y0),
+                    bounds[2].max(x1),
+                    bounds[3].max(y1),
+                ];
+            }
+            units.push(TextUnit {
+                run,
+                block: true,
+                glyphs: group.len(),
+                text: group.iter().map(|glyph| glyph.text.as_str()).collect(),
+                width: Some(width),
+                bounds,
+            });
+        } else {
+            for run in group {
+                units.push(TextUnit {
+                    run: run.clone(),
+                    block: false,
+                    glyphs: 1,
+                    text: run.text.clone(),
+                    width: None,
+                    bounds: run.approximate_box(),
+                });
+            }
+        }
+        index = end;
+    }
+    units
+}
+
+/// Unidade de texto sob o ponto. Empate na distância favorece a de mais glifos
+/// (a palavra, não o espaço vizinho) e o texto clicado.
+pub fn nearest_unit(
+    runs: &[TextRunPlacement],
+    x: f64,
+    y: f64,
+    clicked_text: &str,
+) -> Option<TextUnit> {
+    let clicked = clicked_text.trim();
+    text_units(runs)
+        .into_iter()
+        .filter(|unit| !unit.text.trim().is_empty())
+        .map(|unit| {
+            let [x0, y0, x1, y1] = unit.bounds;
+            let dx = (x0 - x).max(x - x1).max(0.0);
+            let dy = (y0 - y).max(y - y1).max(0.0);
+            let mut score = dx.hypot(dy);
+            let text = unit.text.trim();
+            if !unit.block
+                && !clicked.is_empty()
+                && (text.contains(clicked) || clicked.contains(text))
+            {
+                score -= 6.0;
+            }
+            (score, unit)
+        })
+        .filter(|(score, _)| *score <= 12.0)
+        .min_by(|a, b| a.0.total_cmp(&b.0).then(b.1.glyphs.cmp(&a.1.glyphs)))
+        .map(|(_, unit)| unit)
+}
+
 /// Escolhe o run mais próximo do ponto; empate favorece o texto clicado.
 pub fn nearest_run<'a>(
     runs: &'a [TextRunPlacement],
@@ -1378,5 +1507,41 @@ mod tests {
         cid.text = "\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}\u{9}".into();
         assert!((measure_run_width(&cid, &words) - 85.0).abs() < 1e-6);
         assert_eq!(readable_text(&cid, "mundo"), "");
+    }
+
+    #[test]
+    fn glyph_by_glyph_blocks_form_one_unit() {
+        // Como o Google Docs: cada palavra (ou espaço) é um BT…ET, uma letra por Tj.
+        let content =
+            b"BT /F1 10 Tf 1 0 0 1 100 700 Tm 0 0 Td (O) Tj 6 0 Td (l) Tj 3 0 Td (a) Tj ET \
+            BT /F1 10 Tf 1 0 0 1 100 700 Tm 15 0 Td ( ) Tj ET \
+            BT /F1 10 Tf 1 0 0 1 100 700 Tm 18 0 Td (m) Tj 8 0 Td (u) Tj ET \
+            BT /F1 10 Tf 1 0 0 1 100 650 Tm (Linha comum) Tj ET";
+        let interpreter = interpret(content);
+        let units = text_units(&interpreter.runs);
+        assert_eq!(units.len(), 4);
+        assert!(units[0].block && units[0].glyphs == 3 && units[0].text == "Ola");
+        assert!(!units[0].run.isolatable);
+        // Largura pelas posições: 0..9 + 0,6 em (10 pt) = 15.
+        assert!((units[0].width.unwrap() - 15.0).abs() < 1e-9);
+        assert!(!units[1].block, "espaço sozinho é unidade simples");
+        assert!(!units[3].block && units[3].text == "Linha comum");
+        // Clique na fronteira entre "Ola" e o espaço: vence a palavra.
+        let unit = nearest_unit(&interpreter.runs, 114.0, 703.0, "").unwrap();
+        assert_eq!(unit.text, "Ola");
+        // Mover a unidade move o bloco inteiro (as três letras).
+        let (moved, whole) = transform_run(content, &unit.run, &translation(0.0, -20.0)).unwrap();
+        assert!(whole);
+        let again = interpret(&moved);
+        let ys: Vec<f64> = again.runs[..3]
+            .iter()
+            .map(|run| run.text_rendering_matrix()[5])
+            .collect();
+        assert_eq!(ys, [680.0, 680.0, 680.0]);
+        assert_eq!(
+            again.runs[3].text_rendering_matrix()[5],
+            700.0,
+            "o espaço não muda"
+        );
     }
 }

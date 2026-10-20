@@ -1897,6 +1897,12 @@ unsafe extern "C" fn on_button_press(
         return 0;
     };
     let inside_page = preview_point(widget, event, false).is_ok();
+    drop(rustpdf::trace(|| {
+        format!(
+            "  ponto do clique: {:.1} {:.1} pt (dentro da página: {inside_page})",
+            point.0, point.1
+        )
+    }));
     if current_tool() == ToolMode::Hand {
         shell::hand_press(event);
         return 1;

@@ -11,6 +11,8 @@ optdepends=('tesseract: OCR'
             'tesseract-data-por: OCR em português'
             'openssl: assinatura digital (em desenvolvimento)')
 makedepends=('cargo')
+# Sem o pacote -debug de símbolos (o binário já sai sem informação de depuração).
+options=('!debug')
 source=("rustpdf-@VERSION@.tar.gz")
 sha256sums=('@SHA256@')
 

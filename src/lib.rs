@@ -318,7 +318,10 @@ pub fn tool_output(program: &str, args: &[&OsStr]) -> AppResult<String> {
         .args(args)
         .output()
         .map_err(|e| format!("Não foi possível executar {program}: {e}"))?;
-    if !output.status.success() {
+    // qpdf termina com 3 quando conclui com avisos (PDF com pequenos defeitos
+    // de estrutura): o resultado é válido.
+    let warnings_only = program == "qpdf" && output.status.code() == Some(3);
+    if !output.status.success() && !warnings_only {
         let detail = String::from_utf8_lossy(&output.stderr);
         return Err(format!("{program} falhou: {}", detail.trim()));
     }
@@ -1453,10 +1456,16 @@ impl PdfSession {
         word: &str,
     ) -> AppResult<Option<(Frame, String)>> {
         let words = self.layout_words_user(layout)?;
-        let Some((frame, text)) =
+        let Some((frame, text, block)) =
             content::page_text_frame(pdf, self.page, user.0, user.1, word, &words)?
         else {
             return Ok(None);
+        };
+        // Bloco letra a letra com texto ilegível: rótulo pela palavra do poppler.
+        let text = if text.trim().is_empty() && block {
+            word.to_string()
+        } else {
+            text
         };
         let angle = frame.u.1.atan2(frame.u.0);
         let quarter = (angle / std::f64::consts::FRAC_PI_2).round();
@@ -1524,7 +1533,7 @@ impl PdfSession {
                 .map(|(text, _)| text.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
-            Ok(found.map(|(flat_frame, _)| (flat_frame, label)))
+            Ok(found.map(|(flat_frame, _, _)| (flat_frame, label)))
         });
         let _ = fs::remove_file(&flat);
         Ok(Some(match measured {

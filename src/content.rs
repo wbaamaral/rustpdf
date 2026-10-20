@@ -7,6 +7,9 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::Path;
 use std::ptr;
 
+/// Bit de erro no retorno das funções do qpdf (`QPDF_ERRORS`).
+const QPDF_ERRORS: c_int = 1 << 1;
+
 #[link(name = "qpdf")]
 extern "C" {
     fn qpdf_init() -> *mut c_void;
@@ -84,7 +87,9 @@ impl Document {
     }
 
     fn check(&self, code: c_int) -> AppResult<()> {
-        if code == 0 {
+        // O retorno é uma máscara: QPDF_WARNINGS (1) só avisa (PDF com
+        // pequenos defeitos, ex.: chaves duplicadas); falha é QPDF_ERRORS (2).
+        if code & QPDF_ERRORS == 0 {
             return Ok(());
         }
         if unsafe { qpdf_has_error(self.0) } == 0 {
@@ -770,9 +775,11 @@ pub fn page_text_run(
     let page = open_page(&doc, input, page_number)?;
     let interpreter = interpret_page(&doc, page)?;
     Ok(
-        textmove::nearest_run(&interpreter.runs, x, y, clicked_text).map(|run| {
-            let editable = textmove::run_is_editable(&interpreter.streams[run.stream].1, run);
-            (run.text.clone(), editable)
+        textmove::nearest_unit(&interpreter.runs, x, y, clicked_text).map(|unit| {
+            // Bloco letra a letra: reescrever o texto não é suportado.
+            let editable = !unit.block
+                && textmove::run_is_editable(&interpreter.streams[unit.run.stream].1, &unit.run);
+            (unit.text, editable)
         }),
     )
 }
@@ -788,16 +795,24 @@ pub fn page_text_frame(
     y: f64,
     clicked_text: &str,
     words: &[(String, [f64; 4])],
-) -> AppResult<Option<(Frame, String)>> {
+) -> AppResult<Option<(Frame, String, bool)>> {
     let doc = Document::new()?;
     let page = open_page(&doc, input, page_number)?;
     let interpreter = interpret_page(&doc, page)?;
-    let Some(run) = textmove::nearest_run(&interpreter.runs, x, y, clicked_text) else {
+    let Some(unit) = textmove::nearest_unit(&interpreter.runs, x, y, clicked_text) else {
         return Ok(None);
     };
-    let width = textmove::measure_run_width(run, words);
-    let text = textmove::readable_text(run, clicked_text);
-    Ok(Some((textmove::run_frame(run, width), text)))
+    let width = unit
+        .width
+        .unwrap_or_else(|| textmove::measure_run_width(&unit.run, words));
+    let mut labelled = unit.run.clone();
+    labelled.text = unit.text.clone();
+    let text = textmove::readable_text(&labelled, clicked_text);
+    Ok(Some((
+        textmove::run_frame(&unit.run, width),
+        text,
+        unit.block,
+    )))
 }
 
 /// Imagem desenhada sob (`x`, `y`): nome e moldura da ocorrência mais acima.
@@ -914,9 +929,16 @@ pub fn edit_page_text(
     // Recursos herdados de /Pages passam para cada página antes da análise.
     doc.check(unsafe { qpdf_push_inherited_attributes_to_page(doc.0) })?;
     let interpreter = interpret_page(&doc, page)?;
-    let run = textmove::nearest_run(&interpreter.runs, x, y, clicked_text)
-        .ok_or("Texto não localizado no conteúdo da página")?
-        .clone();
+    let unit = textmove::nearest_unit(&interpreter.runs, x, y, clicked_text)
+        .ok_or("Texto não localizado no conteúdo da página")?;
+    if unit.block && matches!(edit, TextEdit::Replace(_)) {
+        return Err(
+            "Este texto é desenhado letra a letra (ex.: PDF do Google Docs): mover, \
+             redimensionar e girar funcionam, mas reescrever o texto não é suportado"
+                .into(),
+        );
+    }
+    let run = unit.run;
     let mut whole_block = false;
     let cloned_forms = edit_stream(
         &doc,
@@ -928,7 +950,8 @@ pub fn edit_page_text(
             (TextEdit::Replace(text), _) => textmove::replace_run_text(source, &run, text),
             (_, Some(matrix)) => {
                 let (edited, whole) = textmove::transform_run(source, &run, &matrix)?;
-                whole_block = whole;
+                // Numa palavra desenhada letra a letra o bloco é a própria unidade.
+                whole_block = whole && !unit.block;
                 Ok(edited)
             }
             _ => unreachable!(),
@@ -937,7 +960,7 @@ pub fn edit_page_text(
     drop(interpreter);
     finish(&doc, output)?;
     Ok(TextEditOutcome {
-        text: run.text,
+        text: unit.text,
         whole_block,
         cloned_forms,
     })
