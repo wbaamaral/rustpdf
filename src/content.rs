@@ -1,133 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Leitura e edição do conteúdo desenhado da página: textos e imagens.
 use crate::images;
+use crate::infra::qpdf::{ffi::*, path_c, Document};
 use crate::textmove::{self, FormXObject, Frame, Interpreter, Matrix, XObject};
 use crate::AppResult;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_int, CStr, CString};
 use std::path::Path;
 use std::ptr;
-
-/// Bit de erro no retorno das funções do qpdf (`QPDF_ERRORS`).
-const QPDF_ERRORS: c_int = 1 << 1;
-
-#[link(name = "qpdf")]
-extern "C" {
-    fn qpdf_init() -> *mut c_void;
-    fn qpdf_cleanup(qpdf: *mut *mut c_void);
-    fn qpdf_read(qpdf: *mut c_void, filename: *const c_char, password: *const c_char) -> c_int;
-    fn qpdf_init_write(qpdf: *mut c_void, filename: *const c_char) -> c_int;
-    fn qpdf_write(qpdf: *mut c_void) -> c_int;
-    fn qpdf_has_error(qpdf: *mut c_void) -> c_int;
-    fn qpdf_get_error(qpdf: *mut c_void) -> *mut c_void;
-    fn qpdf_get_error_full_text(qpdf: *mut c_void, error: *mut c_void) -> *const c_char;
-    fn qpdf_get_page_n(qpdf: *mut c_void, index: usize) -> u32;
-    fn qpdf_get_num_pages(qpdf: *mut c_void) -> c_int;
-    fn qpdf_push_inherited_attributes_to_page(qpdf: *mut c_void) -> c_int;
-    fn qpdf_oh_get_key(qpdf: *mut c_void, object: u32, key: *const c_char) -> u32;
-    fn qpdf_oh_is_dictionary(qpdf: *mut c_void, object: u32) -> c_int;
-    fn qpdf_oh_is_stream(qpdf: *mut c_void, object: u32) -> c_int;
-    fn qpdf_oh_is_array(qpdf: *mut c_void, object: u32) -> c_int;
-    fn qpdf_oh_get_array_n_items(qpdf: *mut c_void, object: u32) -> c_int;
-    fn qpdf_oh_get_array_item(qpdf: *mut c_void, object: u32, index: c_int) -> u32;
-    fn qpdf_oh_is_name_and_equals(qpdf: *mut c_void, object: u32, name: *const c_char) -> c_int;
-    fn qpdf_oh_get_dict(qpdf: *mut c_void, object: u32) -> u32;
-    fn qpdf_oh_get_name(qpdf: *mut c_void, object: u32) -> *const c_char;
-    fn qpdf_oh_get_numeric_value(qpdf: *mut c_void, object: u32) -> f64;
-    fn qpdf_oh_get_object_id(qpdf: *mut c_void, object: u32) -> c_int;
-    fn qpdf_oh_new_null(qpdf: *mut c_void) -> u32;
-    fn qpdf_oh_new_name(qpdf: *mut c_void, name: *const c_char) -> u32;
-    fn qpdf_oh_new_stream(qpdf: *mut c_void) -> u32;
-    fn qpdf_oh_new_integer(qpdf: *mut c_void, value: i64) -> u32;
-    fn qpdf_oh_replace_key(qpdf: *mut c_void, object: u32, key: *const c_char, item: u32);
-    fn qpdf_oh_remove_key(qpdf: *mut c_void, object: u32, key: *const c_char);
-    fn qpdf_make_indirect_object(qpdf: *mut c_void, object: u32) -> u32;
-    fn qpdf_oh_replace_stream_data(
-        qpdf: *mut c_void,
-        stream: u32,
-        data: *const u8,
-        len: usize,
-        filter: u32,
-        decode_parms: u32,
-    );
-    fn qpdf_oh_get_stream_data(
-        qpdf: *mut c_void,
-        stream_oh: u32,
-        decode_level: c_int,
-        filtered: *mut c_int,
-        bufp: *mut *mut u8,
-        len: *mut usize,
-    ) -> c_int;
-    fn qpdf_oh_get_page_content_data(
-        qpdf: *mut c_void,
-        page: u32,
-        bufp: *mut *mut u8,
-        len: *mut usize,
-    ) -> c_int;
-    fn qpdf_oh_begin_dict_key_iter(qpdf: *mut c_void, dict: u32);
-    fn qpdf_oh_dict_more_keys(qpdf: *mut c_void) -> c_int;
-    fn qpdf_oh_dict_next_key(qpdf: *mut c_void) -> *const c_char;
-}
-
-// Buffers de `qpdf_oh_get_stream_data`/`qpdf_oh_get_page_content_data` são
-// alocados com `malloc` e liberados com `free` (o `qpdf_oh_free_buffer` só
-// existe no qpdf 12; o Ubuntu 24.04 traz o 11.9).
-extern "C" {
-    fn free(pointer: *mut c_void);
-}
-
-struct Document(*mut c_void);
-
-impl Document {
-    fn new() -> AppResult<Self> {
-        let pointer = unsafe { qpdf_init() };
-        if pointer.is_null() {
-            return Err("Não foi possível iniciar o qpdf".into());
-        }
-        Ok(Self(pointer))
-    }
-
-    fn check(&self, code: c_int) -> AppResult<()> {
-        // O retorno é uma máscara: QPDF_WARNINGS (1) só avisa (PDF com
-        // pequenos defeitos, ex.: chaves duplicadas); falha é QPDF_ERRORS (2).
-        if code & QPDF_ERRORS == 0 {
-            return Ok(());
-        }
-        if unsafe { qpdf_has_error(self.0) } == 0 {
-            return Err(format!("qpdf: código {code}"));
-        }
-        let error = unsafe { qpdf_get_error(self.0) };
-        let text = unsafe { qpdf_get_error_full_text(self.0, error) };
-        let message = if text.is_null() {
-            format!("qpdf: código {code}")
-        } else {
-            unsafe { CStr::from_ptr(text) }
-                .to_string_lossy()
-                .into_owned()
-        };
-        Err(message)
-    }
-
-    fn set(&self, object: u32, key: &CStr, value: u32) {
-        unsafe { qpdf_oh_replace_key(self.0, object, key.as_ptr(), value) };
-    }
-
-    fn name(&self, name: &CStr) -> u32 {
-        unsafe { qpdf_oh_new_name(self.0, name.as_ptr()) }
-    }
-}
-
-impl Drop for Document {
-    fn drop(&mut self) {
-        unsafe {
-            let mut pointer = self.0;
-            qpdf_cleanup(&mut pointer);
-        }
-    }
-}
-
-fn path_c(path: &Path) -> AppResult<CString> {
-    crate::path_to_cstring(path)
-}
 
 /// Texto extraído de operadores `Tj`/`TJ`/`'`/`"` no conteúdo da página.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1015,6 +894,14 @@ pub struct ImageEditOutcome {
 }
 
 /// Ocorrências de imagem da página na ordem de desenho, com caixa e moldura.
+/// Segmentos retos pintados na página (espaço padrão, origem embaixo).
+pub fn page_segments(input: &Path, page_number: usize) -> AppResult<Vec<textmove::Segment>> {
+    let doc = Document::new()?;
+    let page = open_page(&doc, input, page_number)?;
+    let segments = interpret_page(&doc, page)?.segments;
+    Ok(segments)
+}
+
 pub fn image_placements(input: &Path, page_number: usize) -> AppResult<Vec<ImagePlacement>> {
     let doc = Document::new()?;
     let page = open_page(&doc, input, page_number)?;

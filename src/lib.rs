@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod app;
+pub mod apresentacao;
+pub mod dominio;
+pub mod infra;
 
 mod annotations;
 mod content;
@@ -13,11 +17,19 @@ mod images;
 mod ocr;
 pub mod textmove;
 
+#[doc(hidden)]
+pub mod testkit;
+
 pub use annotations::AnnotationInfo;
+use app::portas::{LayoutSource, OcrEngine, Renderer};
 pub use content::{
     ImageEditOutcome, ImageInfo, ImagePlacement, ImageTarget, Occurrence, TextEditOutcome,
 };
-pub use textmove::{Frame, Matrix};
+pub use dominio::geometria::{Frame, LayoutRect, Matrix, PdfRect};
+pub use dominio::paginas::{PageError, PageNumber, PageRange};
+pub use infra::ferramentas::{prefer_bundled_tools, tool_command, tool_output, tool_version};
+use infra::poppler::Poppler;
+use infra::tesseract::Tesseract;
 
 /// Objeto selecionado na página.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,11 +69,7 @@ impl Selection {
 
     /// Escala `sx` × `sy` ao longo dos eixos do próprio objeto, em torno do centro.
     pub fn scaling(&self, sx: f64, sy: f64) -> Matrix {
-        let frame = self.frame.matrix();
-        let local = [sx, 0.0, 0.0, sy, 0.5 * (1.0 - sx), 0.5 * (1.0 - sy)];
-        textmove::invert(&frame).map_or(textmove::IDENTITY, |inverse| {
-            textmove::multiply(&textmove::multiply(&inverse, &local), &frame)
-        })
+        self.frame.scaling_about(sx, sy, (0.5, 0.5))
     }
 
     /// Rotação de `degrees` (anti-horário) em torno do centro do objeto.
@@ -236,39 +244,6 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
-/// Pacotes portáteis (Windows) trazem `pdftoppm`, `qpdf` etc. ao lado do
-/// executável: essa pasta entra na frente do `PATH` dos processos filhos, e
-/// `../share/tessdata` (se existir) vira o `TESSDATA_PREFIX` do Tesseract.
-pub fn prefer_bundled_tools() {
-    let Some(directory) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    else {
-        return;
-    };
-    let bundled = ["pdftoppm", "pdftoppm.exe"]
-        .iter()
-        .any(|tool| directory.join(tool).is_file());
-    if !bundled {
-        return;
-    }
-    let mut paths = vec![directory];
-    if let Some(current) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&current));
-    }
-    let tessdata = paths[0]
-        .parent()
-        .map(|prefix| prefix.join("share").join("tessdata"));
-    if let Ok(joined) = std::env::join_paths(paths) {
-        std::env::set_var("PATH", joined);
-    }
-    if let Some(tessdata) = tessdata.filter(|path| path.is_dir()) {
-        if std::env::var_os("TESSDATA_PREFIX").is_none() {
-            std::env::set_var("TESSDATA_PREFIX", tessdata);
-        }
-    }
-}
-
 pub fn parse_checkbox_state(value: &str) -> AppResult<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "sim" | "s" | "true" => Ok(true),
@@ -304,48 +279,9 @@ impl Drop for Trace {
     }
 }
 
-/// Processo de uma ferramenta externa (qpdf, poppler, tesseract). No Windows,
-/// sem `CREATE_NO_WINDOW` cada execução abre e fecha uma janela de console,
-/// porque o aplicativo gráfico não tem console para os filhos herdarem.
-pub fn tool_command(program: &str) -> Command {
-    #[allow(unused_mut)]
-    let mut command = Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    command
-}
-
-pub fn tool_output(program: &str, args: &[&OsStr]) -> AppResult<String> {
-    let _trace = trace(|| {
-        let first = args
-            .iter()
-            .map(|arg| arg.to_string_lossy())
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("  processo {program} {first}")
-    });
-    let output = tool_command(program)
-        .args(args)
-        .output()
-        .map_err(|e| format!("Não foi possível executar {program}: {e}"))?;
-    // qpdf termina com 3 quando conclui com avisos (PDF com pequenos defeitos
-    // de estrutura): o resultado é válido.
-    let warnings_only = program == "qpdf" && output.status.code() == Some(3);
-    if !output.status.success() && !warnings_only {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("{program} falhou: {}", detail.trim()));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
+/// Ferramenta externa com erro em texto (código ainda não migrado para as portas).
 fn run(program: &str, args: &[OsString]) -> AppResult<String> {
-    let refs: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
-    tool_output(program, &refs)
+    infra::ferramentas::run(program, args).map_err(String::from)
 }
 
 pub fn page_count(path: &Path) -> AppResult<usize> {
@@ -387,43 +323,7 @@ pub fn render_thumbnails(
     last: usize,
     width: u32,
 ) -> AppResult<Vec<(usize, PathBuf)>> {
-    let prefix = directory.join(format!("raw-{first}-{last}"));
-    run(
-        "pdftoppm",
-        &[
-            OsString::from("-f"),
-            first.to_string().into(),
-            OsString::from("-l"),
-            last.to_string().into(),
-            OsString::from("-scale-to-x"),
-            width.to_string().into(),
-            OsString::from("-scale-to-y"),
-            OsString::from("-1"),
-            OsString::from("-png"),
-            source.as_os_str().to_owned(),
-            prefix.clone().into_os_string(),
-        ],
-    )?;
-    // O pdftoppm numera com largura variável (raw-1.png, raw-001.png…).
-    let stem = format!("raw-{first}-{last}-");
-    let mut produced = Vec::new();
-    for entry in fs::read_dir(directory)
-        .map_err(|e| format!("Miniaturas: {e}"))?
-        .flatten()
-    {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(number) = name
-            .strip_prefix(&stem)
-            .and_then(|rest| rest.strip_suffix(".png"))
-            .and_then(|number| number.parse::<usize>().ok())
-        else {
-            continue;
-        };
-        let target = directory.join(format!("p-{number:05}.png"));
-        replace_file(&entry.path(), &target).map_err(|e| format!("Miniaturas: {e}"))?;
-        produced.push((number, target));
-    }
-    Ok(produced)
+    Ok(Poppler.render_pages(source, first..=last, width, directory)?)
 }
 
 /// Nome do formato de papel para `width` × `height` pontos (tolerância de 2 mm).
@@ -482,6 +382,8 @@ pub struct PdfSession {
     /// (`Some(página)` ou `None` = documento inteiro), para a interface
     /// atualizar só o que mudou.
     change_counter: u64,
+    /// Cópias feitas por `export_snapshot` (nomes únicos).
+    snapshot_counter: u64,
     changes: Vec<(u64, Option<usize>)>,
 }
 
@@ -630,6 +532,7 @@ impl PdfSession {
             password: password.map(str::to_owned),
             geometry_cache: std::cell::RefCell::new(None),
             change_counter: 0,
+            snapshot_counter: 0,
             changes: Vec::new(),
         })
     }
@@ -678,26 +581,8 @@ impl PdfSession {
     }
 
     pub fn render(&self, width: u32) -> AppResult<PathBuf> {
-        let prefix = self.work_dir.join("preview");
         let image = self.work_dir.join("preview.png");
-        run(
-            "pdftoppm",
-            &[
-                OsString::from("-f"),
-                self.page.to_string().into(),
-                OsString::from("-l"),
-                self.page.to_string().into(),
-                OsString::from("-singlefile"),
-                // Largura exata (a altura segue a proporção da página).
-                OsString::from("-scale-to-x"),
-                width.to_string().into(),
-                OsString::from("-scale-to-y"),
-                OsString::from("-1"),
-                OsString::from("-png"),
-                self.work.as_os_str().to_owned(),
-                prefix.as_os_str().to_owned(),
-            ],
-        )?;
+        Poppler.render_page(&self.work, self.page, width, &image)?;
         Ok(image)
     }
 
@@ -772,6 +657,18 @@ impl PdfSession {
         }
         fs::create_dir_all(&directory).map_err(|e| format!("Miniaturas: {e}"))?;
         Ok((source, directory))
+    }
+
+    /// Cópia do documento como está agora, para exportar em segundo plano
+    /// enquanto a edição continua. Fica na pasta privada da sessão; quem
+    /// usa apaga.
+    pub fn export_snapshot(&mut self) -> AppResult<PathBuf> {
+        self.snapshot_counter += 1;
+        let copy = self
+            .work_dir
+            .join(format!("export-{}.pdf", self.snapshot_counter));
+        fs::copy(&self.work, &copy).map_err(|e| format!("Exportação: {e}"))?;
+        Ok(copy)
     }
 
     /// O documento já tem arquivo em disco (não é um "Novo documento").
@@ -1254,20 +1151,9 @@ impl PdfSession {
         Ok(text_hit_in_page(&layout, x, y, page_height))
     }
 
-    /// XML de `pdftotext -bbox-layout` da página atual.
-    fn page_layout(&self) -> AppResult<String> {
-        run(
-            "pdftotext",
-            &[
-                OsString::from("-f"),
-                self.page.to_string().into(),
-                OsString::from("-l"),
-                self.page.to_string().into(),
-                OsString::from("-bbox-layout"),
-                self.work.as_os_str().to_owned(),
-                OsString::from("-"),
-            ],
-        )
+    /// Layout (blocos, linhas, palavras) da página atual.
+    fn page_layout(&self) -> AppResult<dominio::layout::Page> {
+        Ok(Poppler.layout(&self.work, self.page)?)
     }
 
     /// Converte um ponto visível da página para o espaço padrão do PDF.
@@ -1443,13 +1329,18 @@ impl PdfSession {
     }
 
     /// Palavras do layout do poppler com caixas no espaço padrão da página.
-    fn layout_words_user(&self, layout: &str) -> AppResult<Vec<(String, [f64; 4])>> {
+    fn layout_words_user(
+        &self,
+        layout: &dominio::layout::Page,
+    ) -> AppResult<Vec<(String, [f64; 4])>> {
         let to_user = self.visible_to_user()?;
         let (_, page_height) = self.page_dimensions()?;
         Ok(layout_words(layout)
             .into_iter()
             .map(|(text, [x0, top, x1, bottom])| {
-                let visible = [x0, page_height - bottom, x1, page_height - top];
+                let visible = LayoutRect::new(x0, top, x1, bottom)
+                    .to_pdf(page_height)
+                    .to_array();
                 (
                     text,
                     Frame::from_rect(visible).transformed(&to_user).bounds(),
@@ -1466,7 +1357,7 @@ impl PdfSession {
     fn text_frame(
         &self,
         pdf: &Path,
-        layout: &str,
+        layout: &dominio::layout::Page,
         user: (f64, f64),
         word: &str,
     ) -> AppResult<Option<(Frame, String)>> {
@@ -1509,18 +1400,7 @@ impl PdfSession {
             content::TextEdit::Transform(unrotate),
         )
         .and_then(|_| {
-            let flat_layout = run(
-                "pdftotext",
-                &[
-                    OsString::from("-f"),
-                    self.page.to_string().into(),
-                    OsString::from("-l"),
-                    self.page.to_string().into(),
-                    OsString::from("-bbox-layout"),
-                    flat.as_os_str().to_owned(),
-                    OsString::from("-"),
-                ],
-            )?;
+            let flat_layout = Poppler.layout(&flat, self.page)?;
             // Só as palavras novas: o trecho desgirado pode cair sobre outro texto.
             let same_box =
                 |a: &[f64; 4], b: &[f64; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.5);
@@ -1574,9 +1454,8 @@ impl PdfSession {
     ) -> AppResult<TransformOutcome> {
         selection.check_transform(transform)?;
         let to_user = self.visible_to_user()?;
-        let to_visible = textmove::invert(&to_user).ok_or("Geometria de página inválida")?;
-        let user_transform =
-            textmove::multiply(&textmove::multiply(&to_visible, transform), &to_user);
+        let user_transform = crate::dominio::geometria::from_local(&to_user, transform)
+            .ok_or("Geometria de página inválida")?;
         let (x, y) = textmove::apply(&to_user, selection.anchor);
         let next = self.work_dir.join("next.pdf");
         let _ = fs::remove_file(&next);
@@ -2058,26 +1937,13 @@ impl PdfSession {
     }
 
     pub fn extract_text(&self) -> AppResult<String> {
-        run(
-            "pdftotext",
-            &[
-                OsString::from("-f"),
-                self.page.to_string().into(),
-                OsString::from("-l"),
-                self.page.to_string().into(),
-                OsString::from("-layout"),
-                self.work.as_os_str().to_owned(),
-                OsString::from("-"),
-            ],
-        )
+        Ok(Poppler.text(&self.work, self.page)?)
     }
 
     pub fn ocr_current(&self) -> AppResult<String> {
         let rendered = self.render(2400)?;
-        run(
-            "tesseract",
-            &[rendered.as_os_str().to_owned(), OsString::from("stdout")],
-        )
+        let png = fs::read(&rendered).map_err(|e| format!("OCR: {e}"))?;
+        Ok(Tesseract.text(&png, None)?)
     }
 
     pub fn ocr_searchable_current(&mut self, language: &str) -> AppResult<usize> {
@@ -2090,19 +1956,11 @@ impl PdfSession {
         }
         let (width, height) = self.current_page_size()?;
         let rendered = self.render(2400)?;
-        let tsv = run(
-            "tesseract",
-            &[
-                rendered.as_os_str().to_owned(),
-                OsString::from("stdout"),
-                OsString::from("-l"),
-                OsString::from(language),
-                OsString::from("tsv"),
-            ],
-        )?;
+        let png = fs::read(&rendered).map_err(|e| format!("OCR: {e}"))?;
+        let recognized = Tesseract.words(&png, language)?;
         let overlay = self.work_dir.join("ocr-overlay.pdf");
         let next = self.work_dir.join("next.pdf");
-        let words = ocr::write_searchable_overlay(&rendered, &overlay, width, height, &tsv)?;
+        let words = ocr::write_searchable_overlay(&recognized, &overlay, width, height)?;
         let result = self.apply_qpdf(&[
             self.work.as_os_str().to_owned(),
             OsString::from("--overlay"),
@@ -2218,10 +2076,7 @@ fn write_one_page_pdf(
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
         format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width:.2} {height:.2}] /Resources {resources} /Contents 4 0 R >>").into_bytes(),
     ];
-    let mut content = format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes();
-    content.extend_from_slice(stream);
-    content.extend_from_slice(b"\nendstream");
-    objects.push(content);
+    objects.push(infra::pdf_objetos::stream("", stream));
     if font {
         objects.push(
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
@@ -2232,27 +2087,8 @@ fn write_one_page_pdf(
 }
 
 pub(crate) fn write_pdf_objects(destination: &Path, objects: &[Vec<u8>]) -> AppResult<()> {
-    let mut bytes = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
-    let mut offsets = vec![0];
-    for (index, body) in objects.iter().enumerate() {
-        offsets.push(bytes.len());
-        bytes.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
-        bytes.extend_from_slice(body);
-        bytes.extend_from_slice(b"\nendobj\n");
-    }
-    let xref = bytes.len();
-    bytes.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes());
-    for offset in offsets.iter().skip(1) {
-        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-    }
-    bytes.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
-            offsets.len()
-        )
-        .as_bytes(),
-    );
-    fs::write(destination, bytes).map_err(|e| format!("Geração de PDF: {e}"))
+    fs::write(destination, infra::pdf_objetos::serialize(objects))
+        .map_err(|e| format!("Geração de PDF: {e}"))
 }
 
 /// Texto sob o mouse: linha completa e palavra clicada.
@@ -2264,114 +2100,45 @@ pub struct TextHit {
     pub rect: [f64; 4],
 }
 
-fn xml_attr(tag: &str, name: &str) -> Option<f64> {
-    let key = format!("{name}=\"");
-    let start = tag.find(&key)? + key.len();
-    let end = start + tag[start..].find('"')?;
-    tag[start..end].parse().ok()
-}
-
-fn xml_unescape(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-}
-
 /// Procura no XML de `pdftotext -bbox-layout` a linha que contém o ponto
 /// (`top` medido a partir do topo da página, como o poppler).
 /// Linha sob o ponto visível (`x`, `y`), com a caixa em pontos visíveis.
-fn text_hit_in_page(layout: &str, x: f64, y: f64, page_height: f64) -> Option<TextHit> {
+fn text_hit_in_page(
+    layout: &dominio::layout::Page,
+    x: f64,
+    y: f64,
+    page_height: f64,
+) -> Option<TextHit> {
     text_hit_in_layout(layout, x, page_height - y).map(|mut hit| {
         let [x0, top, x1, bottom] = hit.rect;
-        hit.rect = [x0, page_height - bottom, x1, page_height - top];
+        hit.rect = LayoutRect::new(x0, top, x1, bottom)
+            .to_pdf(page_height)
+            .to_array();
         hit
     })
 }
 
-/// Todas as palavras do XML do poppler: texto e caixa `[x0, topo, x1, base]`.
-fn layout_words(layout: &str) -> Vec<(String, [f64; 4])> {
+/// Todas as palavras do layout: texto e caixa `[x0, topo, x1, base]`.
+fn layout_words(layout: &dominio::layout::Page) -> Vec<(String, [f64; 4])> {
     layout
-        .split("<word ")
-        .skip(1)
-        .filter_map(|chunk| {
-            let (tag, rest) = chunk.split_once('>')?;
-            let text = xml_unescape(rest.split("</word>").next().unwrap_or(""));
-            Some((
-                text,
-                [
-                    xml_attr(tag, "xMin")?,
-                    xml_attr(tag, "yMin")?,
-                    xml_attr(tag, "xMax")?,
-                    xml_attr(tag, "yMax")?,
-                ],
-            ))
-        })
+        .words()
+        .map(|word| (word.text.clone(), layout_array(&word.rect)))
         .collect()
 }
 
-fn text_hit_in_layout(layout: &str, x: f64, top: f64) -> Option<TextHit> {
+fn layout_array(rect: &LayoutRect) -> [f64; 4] {
+    [rect.left(), rect.top(), rect.right(), rect.bottom()]
+}
+
+fn text_hit_in_layout(layout: &dominio::layout::Page, x: f64, top: f64) -> Option<TextHit> {
+    // Clique em qualquer ponto da caixa da linha (inclusive entre palavras).
     const TOLERANCE: f64 = 2.0;
-    let distance_to = |[x0, y0, x1, y1]: [f64; 4]| {
-        let dx = (x0 - x).max(x - x1).max(0.0);
-        let dy = (y0 - top).max(top - y1).max(0.0);
-        dx.hypot(dy)
-    };
-    let mut best: Option<(f64, TextHit)> = None;
-    for line_chunk in layout.split("<line ").skip(1) {
-        let line_body = line_chunk.split("</line>").next().unwrap_or("");
-        let mut words: Vec<(String, [f64; 4])> = Vec::new();
-        // Caixa da linha no sistema do poppler (origem no topo).
-        let mut bounds = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
-        for word_chunk in line_body.split("<word ").skip(1) {
-            let Some((tag, rest)) = word_chunk.split_once('>') else {
-                continue;
-            };
-            let text = xml_unescape(rest.split("</word>").next().unwrap_or(""));
-            let (Some(x0), Some(y0), Some(x1), Some(y1)) = (
-                xml_attr(tag, "xMin"),
-                xml_attr(tag, "yMin"),
-                xml_attr(tag, "xMax"),
-                xml_attr(tag, "yMax"),
-            ) else {
-                continue;
-            };
-            bounds = [
-                bounds[0].min(x0),
-                bounds[1].min(y0),
-                bounds[2].max(x1),
-                bounds[3].max(y1),
-            ];
-            words.push((text, [x0, y0, x1, y1]));
-        }
-        // Clique em qualquer ponto da caixa da linha (inclusive entre palavras).
-        let distance = distance_to(bounds);
-        if words.is_empty() || distance > TOLERANCE {
-            continue;
-        }
-        if best.as_ref().is_none_or(|(score, _)| distance < *score) {
-            let word = words
-                .iter()
-                .min_by(|a, b| distance_to(a.1).total_cmp(&distance_to(b.1)))
-                .map(|(text, _)| text.clone())
-                .unwrap_or_default();
-            let line = words
-                .iter()
-                .map(|(text, _)| text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            best = Some((
-                distance,
-                TextHit {
-                    line,
-                    word,
-                    rect: bounds,
-                },
-            ));
-        }
-    }
-    best.map(|(_, hit)| hit)
+    let hit = layout.line_at((x, top), TOLERANCE)?;
+    Some(TextHit {
+        line: hit.line.text(),
+        word: hit.word.text.clone(),
+        rect: layout_array(&hit.line.rect()?),
+    })
 }
 
 #[cfg(test)]
@@ -2380,9 +2147,8 @@ mod tests {
 
     #[test]
     fn creates_and_edits_real_pdf() {
-        let root = std::env::temp_dir().join(format!("rustpdf-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("test");
+        let root = dir.path().to_path_buf();
         let input = root.join("blank.pdf");
         create_blank_pdf(&input).unwrap();
         assert_eq!(page_count(&input).unwrap(), 1);
@@ -2430,15 +2196,12 @@ mod tests {
         assert_eq!(page_count(&out).unwrap(), 1);
         session.render(500).unwrap();
         drop(session);
-        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn undo_redo_restores_pdf_and_saved_state() {
-        let root =
-            std::env::temp_dir().join(format!("rustpdf-history-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("history-test");
+        let root = dir.path().to_path_buf();
         let source = root.join("source.pdf");
         create_blank_pdf(&source).unwrap();
         let mut session = PdfSession::open(&source).unwrap();
@@ -2465,14 +2228,12 @@ mod tests {
         session.rotate_current().unwrap();
         assert!(!session.can_redo());
         drop(session);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn crop_changes_page_box_and_is_undoable() {
-        let root = std::env::temp_dir().join(format!("rustpdf-crop-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("crop-test");
+        let root = dir.path().to_path_buf();
         let source = root.join("source.pdf");
         create_blank_pdf(&source).unwrap();
         let mut session = PdfSession::open(&source).unwrap();
@@ -2482,15 +2243,12 @@ mod tests {
         session.undo().unwrap();
         assert_eq!(session.current_page_size().unwrap(), (595.0, 842.0));
         drop(session);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn highlight_is_rendered_and_undoable() {
-        let root =
-            std::env::temp_dir().join(format!("rustpdf-highlight-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("highlight-test");
+        let root = dir.path().to_path_buf();
         let source = root.join("source.pdf");
         create_blank_pdf(&source).unwrap();
         let mut session = PdfSession::open(&source).unwrap();
@@ -2511,23 +2269,16 @@ mod tests {
         session.undo().unwrap();
         assert_eq!(before, fs::read(session.render(500).unwrap()).unwrap());
         drop(session);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn image_is_embedded_as_pdf_xobject() {
-        let root = std::env::temp_dir().join(format!("rustpdf-image-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("image-test");
+        let root = dir.path().to_path_buf();
         let source = root.join("source.pdf");
         let image = root.join("pixels.png");
         create_blank_pdf(&source).unwrap();
-        const PNG: &[u8] = &[
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2,
-            8, 6, 0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 18, 73, 68, 65, 84, 120, 156, 99, 248, 207,
-            192, 240, 31, 12, 129, 52, 24, 0, 0, 73, 200, 9, 247, 249, 171, 182, 13, 0, 0, 0, 0,
-            73, 69, 78, 68, 174, 66, 96, 130,
-        ];
+        const PNG: &[u8] = crate::testkit::PNG_2X2;
         fs::write(&image, PNG).unwrap();
         let mut session = PdfSession::open(&source).unwrap();
         session.insert_image(&image).unwrap();
@@ -2544,14 +2295,12 @@ mod tests {
         session.undo().unwrap();
         assert!(!session.dirty);
         drop(session);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn ocr_adds_searchable_text_without_changing_page_pixels() {
-        let root = std::env::temp_dir().join(format!("rustpdf-ocr-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("ocr-test");
+        let root = dir.path().to_path_buf();
         let blank = root.join("blank.pdf");
         let image = root.join("printed-page.png");
         create_blank_pdf(&blank).unwrap();
@@ -2571,14 +2320,12 @@ mod tests {
         scanned.undo().unwrap();
         assert!(scanned.extract_text().unwrap().trim().is_empty());
         drop(scanned);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn text_fields_remain_editable_pdf_objects() {
-        let root = std::env::temp_dir().join(format!("rustpdf-form-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("form-test");
+        let root = dir.path().to_path_buf();
         let source = root.join("blank.pdf");
         create_blank_pdf(&source).unwrap();
         let mut session = PdfSession::open(&source).unwrap();
@@ -2619,15 +2366,12 @@ mod tests {
         assert!(!session.extract_text().unwrap().contains("123"));
         assert!(session.extract_text().unwrap().contains("Ana"));
         drop(session);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn checkbox_state_changes_appearance_and_is_undoable() {
-        let root =
-            std::env::temp_dir().join(format!("rustpdf-checkbox-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("checkbox-test");
+        let root = dir.path().to_path_buf();
         let source = root.join("blank.pdf");
         create_blank_pdf(&source).unwrap();
         let mut session = PdfSession::open(&source).unwrap();
@@ -2670,14 +2414,12 @@ mod tests {
         session.redo().unwrap();
         assert_eq!(on, fs::read(session.render(800).unwrap()).unwrap());
         drop(session);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn radio_and_choice_fields_are_valid_acroform_widgets() {
-        let root = std::env::temp_dir().join(format!("rustpdf-radio-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("radio-test");
+        let root = dir.path().to_path_buf();
         let source = root.join("blank.pdf");
         create_blank_pdf(&source).unwrap();
         let mut session = PdfSession::open(&source).unwrap();
@@ -2752,61 +2494,24 @@ mod tests {
         let fields = session.list_form_fields().unwrap();
         assert!(fields.contains(&("escolha".into(), "rádio".into(), "/OptSim".into())));
         drop(session);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn text_and_image_can_be_placed_at_pdf_coordinates() {
-        let root =
-            std::env::temp_dir().join(format!("rustpdf-position-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("position-test");
+        let root = dir.path().to_path_buf();
         let source = root.join("blank.pdf");
         create_blank_pdf(&source).unwrap();
         let mut session = PdfSession::open(&source).unwrap();
         session
             .insert_visible_text_at("ESQUERDA", 72.0, 720.0, 18.0)
             .unwrap();
-        let left = run(
-            "pdftotext",
-            &[
-                OsString::from("-bbox"),
-                session.work_path().as_os_str().to_owned(),
-                OsString::from("-"),
-            ],
-        )
-        .unwrap();
-        let left_x: f64 = left
-            .split("word xMin=\"")
-            .nth(1)
-            .unwrap()
-            .split('"')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let left_x = layout_words(&session.page_layout().unwrap())[0].1[0];
         session.undo().unwrap();
         session
             .insert_visible_text_at("DIREITA", 300.0, 300.0, 18.0)
             .unwrap();
-        let right = run(
-            "pdftotext",
-            &[
-                OsString::from("-bbox"),
-                session.work_path().as_os_str().to_owned(),
-                OsString::from("-"),
-            ],
-        )
-        .unwrap();
-        let right_x: f64 = right
-            .split("word xMin=\"")
-            .nth(1)
-            .unwrap()
-            .split('"')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let right_x = layout_words(&session.page_layout().unwrap())[0].1[0];
         assert!(right_x - left_x > 200.0);
         let image = root.join("page.png");
         session.export_png(&image).unwrap();
@@ -2833,15 +2538,12 @@ mod tests {
         )
         .unwrap();
         drop(session);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn rotated_and_cropped_pages_map_visible_coordinates() {
-        let root =
-            std::env::temp_dir().join(format!("rustpdf-geometry-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("geometry-test");
+        let root = dir.path().to_path_buf();
         let source = root.join("blank.pdf");
         create_blank_pdf(&source).unwrap();
         let mut rotated = PdfSession::open(&source).unwrap();
@@ -2854,16 +2556,9 @@ mod tests {
         rotated
             .insert_visible_text_at("ROTATED", 72.0, 72.0, 18.0)
             .unwrap();
-        let bbox = run(
-            "pdftotext",
-            &[
-                OsString::from("-bbox"),
-                rotated.work_path().as_os_str().to_owned(),
-                OsString::from("-"),
-            ],
-        )
-        .unwrap();
-        assert!(bbox.contains("xMin=\"72.000000\""));
+        let words = layout_words(&rotated.page_layout().unwrap());
+        let (_, rect) = words.iter().find(|(text, _)| text == "ROTATED").unwrap();
+        assert_eq!(rect[0], 72.0);
         let json = run(
             "qpdf",
             &[
@@ -2914,15 +2609,12 @@ mod tests {
             .collect();
         assert_eq!(coordinates, [108.0, 108.0, 132.0, 132.0]);
         drop(cropped);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn encrypted_pdf_keeps_encryption_unless_explicitly_removed() {
-        let root =
-            std::env::temp_dir().join(format!("rustpdf-encrypted-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("encrypted-test");
+        let root = dir.path().to_path_buf();
         let blank = root.join("blank.pdf");
         let protected = root.join("protected.pdf");
         let exported = root.join("exported.pdf");
@@ -2991,30 +2683,19 @@ mod tests {
         assert!(is_encrypted(&protected).unwrap());
         assert!(session.extract_text().unwrap().contains("Aberto"));
         drop(session);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn existing_text_and_images_can_be_edited() {
-        let root = std::env::temp_dir().join(format!("rustpdf-edit-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("edit-test");
+        let root = dir.path().to_path_buf();
         let source = root.join("source.pdf");
         create_blank_pdf(&source).unwrap();
-        const PNG: &[u8] = &[
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2,
-            8, 2, 0, 0, 0, 253, 212, 154, 115, 0, 0, 0, 20, 73, 68, 65, 84, 120, 218, 99, 248, 207,
-            192, 192, 0, 194, 12, 255, 255, 255, 103, 0, 0, 30, 239, 4, 252, 115, 28, 83, 204, 0,
-            0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-        ];
-        const PNG2: &[u8] = &[
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 4, 0, 0, 0, 2,
-            8, 2, 0, 0, 0, 240, 202, 234, 52, 0, 0, 0, 29, 73, 68, 65, 84, 120, 218, 99, 248, 207,
-            192, 192, 0, 198, 255, 129, 36, 151, 136, 156, 134, 145, 141, 91, 64, 84, 74, 94, 5, 0,
-            107, 244, 8, 8, 38, 8, 156, 31, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-        ];
+        // Imagens RGB de 2 × 2 e 4 × 2 (o tamanho é o que o teste confere).
+        let png = crate::infra::png::encode_rgb(2, 2, &[90; 2 * 2 * 3]).unwrap();
+        let png2 = crate::infra::png::encode_rgb(4, 2, &[200; 4 * 2 * 3]).unwrap();
         let pixels = root.join("pixels.png");
-        fs::write(&pixels, PNG).unwrap();
+        fs::write(&pixels, &png).unwrap();
         let mut session = PdfSession::open(&source).unwrap();
         session
             .insert_visible_text_at("ORIGINAL", 120.0, 500.0, 18.0)
@@ -3037,7 +2718,7 @@ mod tests {
         assert!(session.replace_text("AUSENTE", "X").is_err());
 
         let pixels2 = root.join("pixels2.png");
-        fs::write(&pixels2, PNG2).unwrap();
+        fs::write(&pixels2, &png2).unwrap();
         session
             .replace_image(&name, &pixels2, Occurrence::Only)
             .unwrap();
@@ -3072,7 +2753,6 @@ mod tests {
         )
         .unwrap();
         drop(session);
-        fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -3082,19 +2762,13 @@ mod mouse_hit_tests {
 
     #[test]
     fn image_placements_and_annotation_move_work() {
-        let root = std::env::temp_dir().join(format!("rustpdf-mouse-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("mouse");
+        let root = dir.path().to_path_buf();
         let source = root.join("s.pdf");
         create_blank_pdf(&source).unwrap();
         let png = root.join("p.png");
-        const PNG: &[u8] = &[
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2,
-            8, 2, 0, 0, 0, 253, 212, 154, 115, 0, 0, 0, 20, 73, 68, 65, 84, 120, 218, 99, 248, 207,
-            192, 192, 0, 194, 12, 255, 255, 255, 103, 0, 0, 30, 239, 4, 252, 115, 28, 83, 204, 0,
-            0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-        ];
-        std::fs::write(&png, PNG).unwrap();
+        let png_bytes = crate::infra::png::encode_rgb(2, 2, &[120; 2 * 2 * 3]).unwrap();
+        std::fs::write(&png, &png_bytes).unwrap();
         let mut session = PdfSession::open(&source).unwrap();
         session
             .insert_image_at(&png, 100.0, 300.0, 80.0, 80.0)
@@ -3118,7 +2792,57 @@ mod mouse_hit_tests {
             "rect={:?}",
             moved.rect
         );
-        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pdf_with_qpdf_warnings_stays_editable() {
+        // Chave /Font duplicada: o qpdf lê com aviso (QPDF_WARNINGS), não erro.
+        let dir = crate::testkit::TempDir::new("qpdf-warnings");
+        let input = dir.join("aviso.pdf");
+        let mut pdf = crate::testkit::PdfBuilder::new();
+        let font = pdf.helvetica();
+        pdf.page(
+            595.0,
+            842.0,
+            &format!("/Font << /F1 {font} >> /Font << /F1 {font} >>"),
+            "BT /F1 20 Tf 1 0 0 1 72 700 Tm (Aviso) Tj ET",
+        );
+        pdf.write(&input);
+        let mut session = PdfSession::open(&input).unwrap();
+        // Caminho das anotações (annotations.rs).
+        session.add_text_note_at("nota", 300.0, 300.0).unwrap();
+        assert_eq!(session.list_annotations().unwrap().len(), 1);
+        // Caminho do conteúdo (content.rs).
+        session
+            .move_text((80.0, 705.0), (80.0, 505.0), "Aviso")
+            .unwrap();
+        assert!(session.text_at(80.0, 505.0).unwrap().is_some());
+        assert!(session.text_at(80.0, 705.0).unwrap().is_none());
+    }
+
+    #[test]
+    fn export_snapshot_is_an_independent_copy() {
+        let dir = crate::testkit::TempDir::new("snapshot");
+        let input = dir.join("in.pdf");
+        create_blank_pdf(&input).unwrap();
+        let mut session = PdfSession::open(&input).unwrap();
+        let first = session.export_snapshot().unwrap();
+        let second = session.export_snapshot().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            fs::read(&first).unwrap(),
+            fs::read(session.work_path()).unwrap()
+        );
+        session.insert_blank_after().unwrap();
+        assert_eq!(
+            page_count(&first).unwrap(),
+            1,
+            "a edição não altera a cópia"
+        );
+        assert!(
+            first.starts_with(&session.work_dir),
+            "fica na pasta privada da sessão"
+        );
     }
 
     #[test]
@@ -3128,6 +2852,7 @@ mod mouse_hit_tests {
 <word xMin="100" yMin="527" xMax="131" yMax="546">Ola</word>
 <word xMin="136" yMin="527" xMax="198" yMax="546">mundo &amp; cia</word>
 </line></block></flow></page>"#;
+        let layout = &infra::poppler::parse_bbox_layout(layout)[0];
         let hit = text_hit_in_layout(layout, 150.0, 535.0).unwrap();
         assert_eq!(hit.word, "mundo & cia");
         assert_eq!(hit.line, "Ola mundo & cia");
@@ -3143,9 +2868,8 @@ mod mouse_hit_tests {
 
     #[test]
     fn edits_text_clicked_on_real_pdf() {
-        let root = std::env::temp_dir().join(format!("rustpdf-text-at-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("text-at");
+        let root = dir.path().to_path_buf();
         let input = root.join("blank.pdf");
         create_blank_pdf(&input).unwrap();
         let mut session = PdfSession::open(&input).unwrap();
@@ -3174,14 +2898,12 @@ mod mouse_hit_tests {
             .replace_text_at((140.0, 305.0), &hit.word, "Tchau")
             .unwrap();
         assert!(session.extract_text().unwrap().contains("Tchau"));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn moves_visible_text_by_drag() {
-        let root = std::env::temp_dir().join(format!("rustpdf-move-text-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("move-text");
+        let root = dir.path().to_path_buf();
         let input = root.join("blank.pdf");
         create_blank_pdf(&input).unwrap();
         let mut session = PdfSession::open(&input).unwrap();
@@ -3206,47 +2928,32 @@ mod mouse_hit_tests {
         assert!(session.can_undo());
         session.undo().unwrap();
         assert!(session.text_at(120.0, 305.0).unwrap().is_some());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    fn stream_object(dictionary: &str, data: &str) -> Vec<u8> {
-        format!(
-            "<< {dictionary} /Length {} >>\nstream\n{data}\nendstream",
-            data.len()
-        )
-        .into_bytes()
     }
 
     #[test]
     fn text_edits_do_not_leak_to_other_copies() {
-        let root = std::env::temp_dir().join(format!("rustpdf-shared-form-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("shared-form");
+        let root = dir.path().to_path_buf();
         let input = root.join("shared.pdf");
         // Form 5 é desenhado duas vezes na página 1 e uma vez na página 2.
-        let resources = "/Resources << /XObject << /F1 5 0 R >> /Font << /H 7 0 R >> >>";
-        write_pdf_objects(
-            &input,
-            &[
-                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-                b"<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>".to_vec(),
-                format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] {resources} /Contents 4 0 R >>").into_bytes(),
-                stream_object(
-                    "",
-                    "q /F1 Do Q q 1 0 0 1 0 300 cm /F1 Do Q \
-                     BT /H 20 Tf 1 0 0 1 300 700 Tm (Total) Tj ET \
-                     BT /H 20 Tf 1 0 0 1 300 600 Tm (Total) Tj ET",
-                ),
-                stream_object(
-                    "/Type /XObject /Subtype /Form /BBox [0 0 595 842] /Resources << /Font << /H 7 0 R >> >>",
-                    "BT /H 20 Tf 1 0 0 1 100 100 Tm (Repetido) Tj ET",
-                ),
-                format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] {resources} /Contents 8 0 R >>").into_bytes(),
-                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
-                stream_object("", "/F1 Do"),
-            ],
-        )
-        .unwrap();
+        let mut pdf = crate::testkit::PdfBuilder::new();
+        let font = pdf.helvetica();
+        let form = pdf.form(
+            [0.0, 0.0, 595.0, 842.0],
+            &format!("/Font << /H {font} >>"),
+            "BT /H 20 Tf 1 0 0 1 100 100 Tm (Repetido) Tj ET",
+        );
+        let resources = format!("/XObject << /F1 {form} >> /Font << /H {font} >>");
+        pdf.page(
+            595.0,
+            842.0,
+            &resources,
+            "q /F1 Do Q q 1 0 0 1 0 300 cm /F1 Do Q \
+             BT /H 20 Tf 1 0 0 1 300 700 Tm (Total) Tj ET \
+             BT /H 20 Tf 1 0 0 1 300 600 Tm (Total) Tj ET",
+        );
+        pdf.page(595.0, 842.0, &resources, "/F1 Do");
+        pdf.write(&input);
         let mut session = PdfSession::open(&input).unwrap();
         let present =
             |session: &PdfSession, x: f64, y: f64| session.text_at(x, y).unwrap().is_some();
@@ -3305,35 +3012,33 @@ mod mouse_hit_tests {
         let saved = root.join("saved.pdf");
         session.save_as(&saved).unwrap();
         run("qpdf", &[OsString::from("--check"), saved.into_os_string()]).unwrap();
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn nested_shared_forms_are_copied_along_the_path() {
-        let root = std::env::temp_dir().join(format!("rustpdf-nested-form-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("nested-form");
+        let root = dir.path().to_path_buf();
         let input = root.join("nested.pdf");
         // Página desenha A duas vezes; A desenha B; B mostra o texto.
-        write_pdf_objects(
-            &input,
-            &[
-                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /XObject << /A 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
-                stream_object("", "q /A Do Q q 1 0 0 1 0 300 cm /A Do Q"),
-                stream_object(
-                    "/Type /XObject /Subtype /Form /BBox [0 0 595 842] /Resources << /XObject << /B 6 0 R >> >>",
-                    "/B Do",
-                ),
-                stream_object(
-                    "/Type /XObject /Subtype /Form /BBox [0 0 595 842] /Resources << /Font << /H 7 0 R >> >>",
-                    "BT /H 20 Tf 1 0 0 1 100 100 Tm (Aninhado) Tj ET",
-                ),
-                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
-            ],
-        )
-        .unwrap();
+        let mut pdf = crate::testkit::PdfBuilder::new();
+        let font = pdf.helvetica();
+        let inner = pdf.form(
+            [0.0, 0.0, 595.0, 842.0],
+            &format!("/Font << /H {font} >>"),
+            "BT /H 20 Tf 1 0 0 1 100 100 Tm (Aninhado) Tj ET",
+        );
+        let outer = pdf.form(
+            [0.0, 0.0, 595.0, 842.0],
+            &format!("/XObject << /B {inner} >>"),
+            "/B Do",
+        );
+        pdf.page(
+            595.0,
+            842.0,
+            &format!("/XObject << /A {outer} >>"),
+            "q /A Do Q q 1 0 0 1 0 300 cm /A Do Q",
+        );
+        pdf.write(&input);
         let mut session = PdfSession::open(&input).unwrap();
         let outcome = session
             .move_text((130.0, 405.0), (330.0, 405.0), "Aninhado")
@@ -3342,7 +3047,6 @@ mod mouse_hit_tests {
         assert!(session.text_at(330.0, 405.0).unwrap().is_some());
         assert!(session.text_at(130.0, 405.0).unwrap().is_none());
         assert!(session.text_at(130.0, 105.0).unwrap().is_some());
-        let _ = fs::remove_dir_all(root);
     }
 
     fn assert_bounds(frame: &Frame, expected: [f64; 4]) {
@@ -3354,18 +3058,12 @@ mod mouse_hit_tests {
 
     #[test]
     fn resizes_and_rotates_selected_objects() {
-        let root = std::env::temp_dir().join(format!("rustpdf-transform-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("transform");
+        let root = dir.path().to_path_buf();
         let source = root.join("source.pdf");
         let image = root.join("pixels.png");
         create_blank_pdf(&source).unwrap();
-        const PNG: &[u8] = &[
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2,
-            8, 6, 0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 18, 73, 68, 65, 84, 120, 156, 99, 248, 207,
-            192, 240, 31, 12, 129, 52, 24, 0, 0, 73, 200, 9, 247, 249, 171, 182, 13, 0, 0, 0, 0,
-            73, 69, 78, 68, 174, 66, 96, 130,
-        ];
+        const PNG: &[u8] = crate::testkit::PNG_2X2;
         fs::write(&image, PNG).unwrap();
         let mut session = PdfSession::open(&source).unwrap();
         session
@@ -3463,7 +3161,6 @@ mod mouse_hit_tests {
         let saved = root.join("saved.pdf");
         session.save_as(&saved).unwrap();
         run("qpdf", &[OsString::from("--check"), saved.into_os_string()]).unwrap();
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3532,35 +3229,23 @@ mod mouse_hit_tests {
 
     #[test]
     fn image_operations_target_single_occurrences() {
-        let root = std::env::temp_dir().join(format!("rustpdf-image-occ-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("image-occ");
+        let root = dir.path().to_path_buf();
         let input = root.join("shared-image.pdf");
         // O mesmo XObject 5 é desenhado 2× na página 1 e 1× na página 2.
-        let resources = "/Resources << /XObject << /Im1 5 0 R >> >>";
-        write_pdf_objects(
-            &input,
-            &[
-                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-                b"<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>".to_vec(),
-                format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] {resources} /Contents 4 0 R >>").into_bytes(),
-                stream_object("", "q 100 0 0 50 10 20 cm /Im1 Do Q q 100 0 0 50 10 200 cm /Im1 Do Q"),
-                stream_object(
-                    "/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8",
-                    "abc",
-                ),
-                format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] {resources} /Contents 7 0 R >>").into_bytes(),
-                stream_object("", "q 100 0 0 50 10 20 cm /Im1 Do Q"),
-            ],
-        )
-        .unwrap();
+        let mut pdf = crate::testkit::PdfBuilder::new();
+        let image = pdf.image_rgb(1, 1, b"abc");
+        let resources = format!("/XObject << /Im1 {image} >>");
+        pdf.page(
+            595.0,
+            842.0,
+            &resources,
+            "q 100 0 0 50 10 20 cm /Im1 Do Q q 100 0 0 50 10 200 cm /Im1 Do Q",
+        );
+        pdf.page(595.0, 842.0, &resources, "q 100 0 0 50 10 20 cm /Im1 Do Q");
+        pdf.write(&input);
         let png = root.join("pixels.png");
-        const PNG: &[u8] = &[
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2,
-            8, 6, 0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 18, 73, 68, 65, 84, 120, 156, 99, 248, 207,
-            192, 240, 31, 12, 129, 52, 24, 0, 0, 73, 200, 9, 247, 249, 171, 182, 13, 0, 0, 0, 0,
-            73, 69, 78, 68, 174, 66, 96, 130,
-        ];
+        const PNG: &[u8] = crate::testkit::PNG_2X2;
         fs::write(&png, PNG).unwrap();
         let mut session = PdfSession::open(&input).unwrap();
         let draws = |session: &PdfSession| -> Vec<(String, usize, f64, f64)> {
@@ -3634,7 +3319,6 @@ mod mouse_hit_tests {
         let saved = root.join("saved.pdf");
         session.save_as(&saved).unwrap();
         run("qpdf", &[OsString::from("--check"), saved.into_os_string()]).unwrap();
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3644,9 +3328,8 @@ mod mouse_hit_tests {
         assert_eq!(paper_label(612.0, 792.0), "Carta (216 × 279 mm)");
         assert_eq!(paper_label(500.0, 500.0), "176 × 176 mm");
 
-        let root = std::env::temp_dir().join(format!("rustpdf-ui-helpers-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("ui-helpers");
+        let root = dir.path().to_path_buf();
         let input = root.join("blank.pdf");
         create_blank_pdf(&input).unwrap();
         let mut session = PdfSession::open(&input).unwrap();
@@ -3675,14 +3358,12 @@ mod mouse_hit_tests {
         assert!(session.list_annotations().unwrap().is_empty());
         let blank = PdfSession::new_blank().unwrap();
         assert!(!blank.has_file());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn change_log_reports_affected_pages() {
-        let root = std::env::temp_dir().join(format!("rustpdf-changes-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let dir = crate::testkit::TempDir::new("changes");
+        let root = dir.path().to_path_buf();
         let input = root.join("blank.pdf");
         create_blank_pdf(&input).unwrap();
         let mut session = PdfSession::open(&input).unwrap();
@@ -3718,7 +3399,6 @@ mod mouse_hit_tests {
         session.rotate_current().unwrap();
         let after = session.page_dimensions().unwrap();
         assert_eq!((before.1, before.0), after);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

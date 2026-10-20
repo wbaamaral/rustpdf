@@ -48,6 +48,13 @@ jobs:
             exit 1
           fi
 
+  verificacao:
+    name: Verificação (CI)
+    needs: check
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ github.event_name == 'push' && github.ref_name || (inputs.tag != '' && inputs.tag || github.sha) }}
+
   linux-ubuntu:
     name: Linux portátil e .deb (Ubuntu)
     needs: check
@@ -168,7 +175,7 @@ jobs:
 
   release:
     name: Publicar na página de Releases
-    needs: [check, linux-ubuntu, linux-arch, linux-fedora, windows]
+    needs: [check, verificacao, linux-ubuntu, linux-arch, linux-fedora, windows]
     if: ${{ github.event_name == 'push' || inputs.tag != '' }}
     runs-on: ubuntu-24.04
     steps:

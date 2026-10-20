@@ -1,101 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Escrita de anotações PDF pela API C de qpdf, chamada diretamente de Rust.
+use crate::infra::qpdf::{ffi::*, path_c, Document};
 use crate::AppResult;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_int, CStr, CString};
 use std::path::Path;
-
-#[link(name = "qpdf")]
-extern "C" {
-    fn qpdf_init() -> *mut c_void;
-    fn qpdf_cleanup(qpdf: *mut *mut c_void);
-    fn qpdf_read(qpdf: *mut c_void, filename: *const c_char, password: *const c_char) -> c_int;
-    fn qpdf_init_write(qpdf: *mut c_void, filename: *const c_char) -> c_int;
-    fn qpdf_write(qpdf: *mut c_void) -> c_int;
-    fn qpdf_has_error(qpdf: *mut c_void) -> c_int;
-    fn qpdf_get_error(qpdf: *mut c_void) -> *mut c_void;
-    fn qpdf_get_error_full_text(qpdf: *mut c_void, error: *mut c_void) -> *const c_char;
-    fn qpdf_get_page_n(qpdf: *mut c_void, index: usize) -> u32;
-    fn qpdf_get_root(qpdf: *mut c_void) -> u32;
-    fn qpdf_push_inherited_attributes_to_page(qpdf: *mut c_void) -> c_int;
-    fn qpdf_oh_get_key(qpdf: *mut c_void, object: u32, key: *const c_char) -> u32;
-    fn qpdf_oh_is_array(qpdf: *mut c_void, object: u32) -> c_int;
-    fn qpdf_oh_is_dictionary(qpdf: *mut c_void, object: u32) -> c_int;
-    fn qpdf_oh_is_stream(qpdf: *mut c_void, object: u32) -> c_int;
-    fn qpdf_oh_is_string(qpdf: *mut c_void, object: u32) -> c_int;
-    fn qpdf_oh_is_name(qpdf: *mut c_void, object: u32) -> c_int;
-    fn qpdf_oh_is_name_and_equals(qpdf: *mut c_void, object: u32, name: *const c_char) -> c_int;
-    fn qpdf_oh_get_dict(qpdf: *mut c_void, object: u32) -> u32;
-    fn qpdf_oh_get_utf8_value(qpdf: *mut c_void, object: u32) -> *const c_char;
-    fn qpdf_oh_get_name(qpdf: *mut c_void, object: u32) -> *const c_char;
-    fn qpdf_oh_get_array_n_items(qpdf: *mut c_void, object: u32) -> c_int;
-    fn qpdf_oh_get_array_item(qpdf: *mut c_void, object: u32, index: c_int) -> u32;
-    fn qpdf_oh_get_numeric_value(qpdf: *mut c_void, object: u32) -> f64;
-    fn qpdf_oh_new_array(qpdf: *mut c_void) -> u32;
-    fn qpdf_oh_new_dictionary(qpdf: *mut c_void) -> u32;
-    fn qpdf_oh_new_null(qpdf: *mut c_void) -> u32;
-    fn qpdf_oh_new_name(qpdf: *mut c_void, name: *const c_char) -> u32;
-    fn qpdf_oh_new_string(qpdf: *mut c_void, value: *const c_char) -> u32;
-    fn qpdf_oh_new_stream(qpdf: *mut c_void) -> u32;
-    fn qpdf_oh_new_integer(qpdf: *mut c_void, value: i64) -> u32;
-    fn qpdf_oh_new_real_from_double(qpdf: *mut c_void, value: f64, decimals: c_int) -> u32;
-    fn qpdf_oh_new_unicode_string(qpdf: *mut c_void, value: *const c_char) -> u32;
-    fn qpdf_oh_append_item(qpdf: *mut c_void, array: u32, item: u32);
-    fn qpdf_oh_get_object_id(qpdf: *mut c_void, object: u32) -> c_int;
-    fn qpdf_oh_replace_key(qpdf: *mut c_void, object: u32, key: *const c_char, item: u32);
-    fn qpdf_make_indirect_object(qpdf: *mut c_void, object: u32) -> u32;
-    fn qpdf_oh_replace_stream_data(
-        qpdf: *mut c_void,
-        stream: u32,
-        data: *const u8,
-        len: usize,
-        filter: u32,
-        decode_parms: u32,
-    );
-}
-
-struct Document(*mut c_void);
-
-impl Document {
-    fn new() -> AppResult<Self> {
-        let ptr = unsafe { qpdf_init() };
-        if ptr.is_null() {
-            Err("qpdf_init falhou".into())
-        } else {
-            Ok(Self(ptr))
-        }
-    }
-
-    fn check(&self, code: c_int) -> AppResult<()> {
-        if code & 2 == 0 && unsafe { qpdf_has_error(self.0) } == 0 {
-            return Ok(());
-        }
-        unsafe {
-            let error = qpdf_get_error(self.0);
-            if error.is_null() {
-                return Err("Erro interno de qpdf".into());
-            }
-            let detail = qpdf_get_error_full_text(self.0, error);
-            if detail.is_null() {
-                return Err("Erro interno de qpdf".into());
-            }
-            Err(CStr::from_ptr(detail).to_string_lossy().into_owned())
-        }
-    }
-
-    fn set(&self, object: u32, key: &CStr, value: u32) {
-        unsafe { qpdf_oh_replace_key(self.0, object, key.as_ptr(), value) }
-    }
-
-    fn name(&self, name: &CStr) -> u32 {
-        unsafe { qpdf_oh_new_name(self.0, name.as_ptr()) }
-    }
-}
-
-impl Drop for Document {
-    fn drop(&mut self) {
-        unsafe { qpdf_cleanup(&mut self.0) }
-    }
-}
 
 pub fn add_text_note_at(
     input: &Path,
@@ -1200,10 +1108,6 @@ fn write_rect(doc: &Document, object: u32, rect: [f64; 4]) {
         unsafe { qpdf_oh_append_item(doc.0, array, number) };
     }
     doc.set(object, c"/Rect", array);
-}
-
-fn path_c(path: &Path) -> AppResult<CString> {
-    crate::path_to_cstring(path)
 }
 
 /// Lista anotações e widgets de formulário com retângulos.

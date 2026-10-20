@@ -1,22 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use rustpdf::apresentacao::cli::{parse_export, ExportFormat};
+use rustpdf::infra::exportacao::export_to_files;
 use rustpdf::{
     create_blank_pdf, parse_checkbox_state, AppResult, ImageEditOutcome, Matrix, Occurrence,
-    PdfSession, Selection, SelectionTarget,
+    PageNumber, PdfSession, Selection, SelectionTarget,
 };
 use std::path::Path;
 
 fn usage() -> &'static str {
-    concat!("Uso: rustpdf-cli [--password-stdin] [--allow-unencrypted-output] COMANDO ...\n  rustpdf-cli info ENTRADA.pdf\n  rustpdf-cli new SAIDA.pdf\n  rustpdf-cli rotate ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli delete ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli append ENTRADA.pdf SAIDA.pdf OUTRO.pdf\n  rustpdf-cli blank-after ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli extract ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli png ENTRADA.pdf SAIDA.png PAGINA\n  rustpdf-cli text ENTRADA.pdf PAGINA\n  rustpdf-cli ocr ENTRADA.pdf PAGINA\n  rustpdf-cli ocr-searchable ENTRADA.pdf SAIDA.pdf PAGINA [IDIOMA]\n  rustpdf-cli fields ENTRADA.pdf\n  rustpdf-cli text-field ENTRADA.pdf SAIDA.pdf PAGINA NOME VALOR X Y LARGURA ALTURA [multiline]\n  rustpdf-cli set-field ENTRADA.pdf SAIDA.pdf NOME NOVO_VALOR\n  rustpdf-cli checkbox ENTRADA.pdf SAIDA.pdf PAGINA NOME SIM_OU_NAO X Y TAMANHO\n  rustpdf-cli set-checkbox ENTRADA.pdf SAIDA.pdf NOME SIM_OU_NAO\n  rustpdf-cli radio ENTRADA.pdf SAIDA.pdf PAGINA NOME SELECAO_OU_- \"op1,op2\" X Y TAMANHO ESPACO\n  rustpdf-cli set-radio ENTRADA.pdf SAIDA.pdf NOME SELECAO\n  rustpdf-cli choice ENTRADA.pdf SAIDA.pdf PAGINA NOME VALOR \"op1,op2\" X Y LARGURA ALTURA [combo|lista]\n  rustpdf-cli set-choice ENTRADA.pdf SAIDA.pdf NOME VALOR\n  rustpdf-cli text-runs ENTRADA.pdf PAGINA\n  rustpdf-cli replace-text ENTRADA.pdf SAIDA.pdf PAGINA ANTIGO NOVO\n  rustpdf-cli images ENTRADA.pdf PAGINA\n  rustpdf-cli image-draws ENTRADA.pdf PAGINA\n  rustpdf-cli replace-image ENTRADA.pdf SAIDA.pdf PAGINA NOME IMAGEM.png [N|todas]\n  rustpdf-cli replace-image-at ENTRADA.pdf SAIDA.pdf PAGINA X Y IMAGEM.png\n  rustpdf-cli move-image ENTRADA.pdf SAIDA.pdf PAGINA NOME DX DY [N|todas]\n  rustpdf-cli remove-image ENTRADA.pdf SAIDA.pdf PAGINA NOME [N|todas]\n  rustpdf-cli remove-image-at ENTRADA.pdf SAIDA.pdf PAGINA X Y\n  rustpdf-cli move-text ENTRADA.pdf SAIDA.pdf PAGINA X Y DX DY\n  rustpdf-cli edit-text-at ENTRADA.pdf SAIDA.pdf PAGINA X Y NOVO_TEXTO\n  rustpdf-cli select ENTRADA.pdf PAGINA X Y\n  rustpdf-cli move-object ENTRADA.pdf SAIDA.pdf PAGINA X Y DX DY\n  rustpdf-cli resize-object ENTRADA.pdf SAIDA.pdf PAGINA X Y FATOR_X FATOR_Y\n  rustpdf-cli rotate-object ENTRADA.pdf SAIDA.pdf PAGINA X Y GRAUS\n  rustpdf-cli transform-object ENTRADA.pdf SAIDA.pdf PAGINA X Y A B C D E F\n  rustpdf-cli note ENTRADA.pdf SAIDA.pdf PAGINA TEXTO\n  rustpdf-cli note-at ENTRADA.pdf SAIDA.pdf PAGINA TEXTO X Y\n  rustpdf-cli highlight-at ENTRADA.pdf SAIDA.pdf PAGINA X Y LARGURA ALTURA\n  rustpdf-cli insert-text ENTRADA.pdf SAIDA.pdf PAGINA TEXTO\n  rustpdf-cli insert-text-at ENTRADA.pdf SAIDA.pdf PAGINA TEXTO X Y TAMANHO_FONTE\n  rustpdf-cli insert-image ENTRADA.pdf SAIDA.pdf PAGINA IMAGEM.png\n  rustpdf-cli insert-image-at ENTRADA.pdf SAIDA.pdf PAGINA IMAGEM.png X Y LARGURA ALTURA\n  rustpdf-cli crop ENTRADA.pdf SAIDA.pdf PAGINA MARGEM_EM_PONTOS\n\nRustPDF ", env!("CARGO_PKG_VERSION"), " — Copyright (C) 2026 Welyqrson Bastos Amaral. Licença AGPL-3.0-or-later; sem garantia.\nCódigo-fonte: https://github.com/wbaamaral/rustpdf")
+    concat!("Uso: rustpdf-cli [--password-stdin] [--allow-unencrypted-output] COMANDO ...\n  rustpdf-cli info ENTRADA.pdf\n  rustpdf-cli new SAIDA.pdf\n  rustpdf-cli rotate ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli delete ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli append ENTRADA.pdf SAIDA.pdf OUTRO.pdf\n  rustpdf-cli blank-after ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli extract ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli png ENTRADA.pdf SAIDA.png PAGINA\n  rustpdf-cli text ENTRADA.pdf PAGINA\n  rustpdf-cli export ENTRADA.pdf SAIDA.{md,docx,pptx,csv,xlsx} [--paginas 1-3,7] [--sem-imagens] [--quebrar-paginas] [--fiel] [--ocr IDIOMA] [--separador ;] [--sem-bom]\n  rustpdf-cli ocr ENTRADA.pdf PAGINA\n  rustpdf-cli ocr-searchable ENTRADA.pdf SAIDA.pdf PAGINA [IDIOMA]\n  rustpdf-cli fields ENTRADA.pdf\n  rustpdf-cli text-field ENTRADA.pdf SAIDA.pdf PAGINA NOME VALOR X Y LARGURA ALTURA [multiline]\n  rustpdf-cli set-field ENTRADA.pdf SAIDA.pdf NOME NOVO_VALOR\n  rustpdf-cli checkbox ENTRADA.pdf SAIDA.pdf PAGINA NOME SIM_OU_NAO X Y TAMANHO\n  rustpdf-cli set-checkbox ENTRADA.pdf SAIDA.pdf NOME SIM_OU_NAO\n  rustpdf-cli radio ENTRADA.pdf SAIDA.pdf PAGINA NOME SELECAO_OU_- \"op1,op2\" X Y TAMANHO ESPACO\n  rustpdf-cli set-radio ENTRADA.pdf SAIDA.pdf NOME SELECAO\n  rustpdf-cli choice ENTRADA.pdf SAIDA.pdf PAGINA NOME VALOR \"op1,op2\" X Y LARGURA ALTURA [combo|lista]\n  rustpdf-cli set-choice ENTRADA.pdf SAIDA.pdf NOME VALOR\n  rustpdf-cli text-runs ENTRADA.pdf PAGINA\n  rustpdf-cli replace-text ENTRADA.pdf SAIDA.pdf PAGINA ANTIGO NOVO\n  rustpdf-cli images ENTRADA.pdf PAGINA\n  rustpdf-cli image-draws ENTRADA.pdf PAGINA\n  rustpdf-cli replace-image ENTRADA.pdf SAIDA.pdf PAGINA NOME IMAGEM.png [N|todas]\n  rustpdf-cli replace-image-at ENTRADA.pdf SAIDA.pdf PAGINA X Y IMAGEM.png\n  rustpdf-cli move-image ENTRADA.pdf SAIDA.pdf PAGINA NOME DX DY [N|todas]\n  rustpdf-cli remove-image ENTRADA.pdf SAIDA.pdf PAGINA NOME [N|todas]\n  rustpdf-cli remove-image-at ENTRADA.pdf SAIDA.pdf PAGINA X Y\n  rustpdf-cli move-text ENTRADA.pdf SAIDA.pdf PAGINA X Y DX DY\n  rustpdf-cli edit-text-at ENTRADA.pdf SAIDA.pdf PAGINA X Y NOVO_TEXTO\n  rustpdf-cli select ENTRADA.pdf PAGINA X Y\n  rustpdf-cli move-object ENTRADA.pdf SAIDA.pdf PAGINA X Y DX DY\n  rustpdf-cli resize-object ENTRADA.pdf SAIDA.pdf PAGINA X Y FATOR_X FATOR_Y\n  rustpdf-cli rotate-object ENTRADA.pdf SAIDA.pdf PAGINA X Y GRAUS\n  rustpdf-cli transform-object ENTRADA.pdf SAIDA.pdf PAGINA X Y A B C D E F\n  rustpdf-cli note ENTRADA.pdf SAIDA.pdf PAGINA TEXTO\n  rustpdf-cli note-at ENTRADA.pdf SAIDA.pdf PAGINA TEXTO X Y\n  rustpdf-cli highlight-at ENTRADA.pdf SAIDA.pdf PAGINA X Y LARGURA ALTURA\n  rustpdf-cli insert-text ENTRADA.pdf SAIDA.pdf PAGINA TEXTO\n  rustpdf-cli insert-text-at ENTRADA.pdf SAIDA.pdf PAGINA TEXTO X Y TAMANHO_FONTE\n  rustpdf-cli insert-image ENTRADA.pdf SAIDA.pdf PAGINA IMAGEM.png\n  rustpdf-cli insert-image-at ENTRADA.pdf SAIDA.pdf PAGINA IMAGEM.png X Y LARGURA ALTURA\n  rustpdf-cli crop ENTRADA.pdf SAIDA.pdf PAGINA MARGEM_EM_PONTOS\n\nRustPDF ", env!("CARGO_PKG_VERSION"), " — Copyright (C) 2026 Welyqrson Bastos Amaral. Licença AGPL-3.0-or-later; sem garantia.\nCódigo-fonte: https://github.com/wbaamaral/rustpdf")
 }
 
 fn parse_page(value: &str, count: usize) -> AppResult<usize> {
-    let page = value
-        .parse::<usize>()
-        .map_err(|_| "Número de página inválido")?;
-    if !(1..=count).contains(&page) {
-        return Err(format!("Página fora de 1..={count}"));
-    }
-    Ok(page)
+    PageNumber::parse(value, count)
+        .map(PageNumber::get)
+        .map_err(|error| error.to_string())
 }
 
 fn parse_number(value: &str, label: &str) -> AppResult<f64> {
@@ -144,6 +142,9 @@ fn execute(args: &[String], password: Option<&str>, allow_unencrypted: bool) -> 
     }
     if operation == "new" && args.len() == 3 {
         return create_blank_pdf(input);
+    }
+    if operation == "export" {
+        return export(&args[2..], password);
     }
     let mut session = if let Some(password) = password {
         PdfSession::open_with_password(input, password)?
@@ -513,6 +514,27 @@ fn execute(args: &[String], password: Option<&str>, allow_unencrypted: bool) -> 
             print!("{text}");
         }
         _ => return Err(usage().into()),
+    }
+    Ok(())
+}
+
+/// `export ENTRADA SAIDA [opções]`: estrutura do texto → arquivo(s).
+fn export(args: &[String], password: Option<&str>) -> AppResult<()> {
+    let command = parse_export(args)?;
+    let session = match password {
+        Some(password) => PdfSession::open_with_password(&command.input, password)?,
+        None => PdfSession::open(&command.input)?,
+    };
+    let written = export_to_files(
+        session.work_path(),
+        session.pages,
+        &command.request,
+        &|_, _| true,
+    )?;
+    if command.request.format == ExportFormat::Csv {
+        for path in written {
+            println!("{}", path.display());
+        }
     }
     Ok(())
 }

@@ -5,6 +5,8 @@
 //! padrão.
 
 use super::*;
+use rustpdf::apresentacao::exportacao::{ExportFormat, ExportRequest};
+use rustpdf::infra::tarefa::Job;
 use std::fs;
 
 #[link(name = "gtk-3")]
@@ -114,11 +116,6 @@ extern "C" {
     fn gtk_get_major_version() -> u32;
     fn gtk_get_minor_version() -> u32;
     fn gtk_get_micro_version() -> u32;
-}
-
-#[link(name = "qpdf")]
-extern "C" {
-    fn qpdf_get_qpdf_version() -> *const c_char;
 }
 
 #[link(name = "gdk-3")]
@@ -521,7 +518,7 @@ toolbar button:checked { background-color: alpha(@theme_selected_bg_color, 0.55)
 /// Monta a janela inteira e devolve o estado inicial.
 pub unsafe fn build() -> AppState {
     if let Some(directory) = icons::install() {
-        if let Ok(path) = path_cstring(&directory) {
+        if let Ok(path) = rustpdf::path_to_cstring(&directory) {
             gtk_icon_theme_append_search_path(gtk_icon_theme_get_default(), path.as_ptr());
         }
     }
@@ -722,6 +719,30 @@ unsafe fn build_menus(b: &mut Builder) -> *mut c_void {
     );
     b.item(export, "Página como _imagem PNG…", 12, &[], Document);
     b.item(export, "_Texto da página", 13, &[], Document);
+    b.separator(export);
+    for (index, format) in rustpdf::apresentacao::exportacao::MENU.iter().enumerate() {
+        let label = match format {
+            ExportFormat::Docx => "Documento como _Word…",
+            ExportFormat::Pptx => "Documento como P_owerPoint…",
+            ExportFormat::Xlsx => "Tabelas como _Excel…",
+            ExportFormat::Markdown => "Documento como _Markdown…",
+            ExportFormat::Csv => "Tabelas como _CSV…",
+        };
+        b.item(
+            export,
+            label,
+            rustpdf::apresentacao::exportacao::FIRST_ACTION + index,
+            &[],
+            Document,
+        );
+    }
+    b.item(
+        export,
+        "Cancelar e_xportação",
+        rustpdf::apresentacao::exportacao::CANCEL_ACTION,
+        &[],
+        Nothing,
+    );
     b.separator(m);
     b.item(m, "_Fechar documento", 59, &["<Control>w"], Document);
     b.item(m, "Sai_r", 99, &["<Control>q"], Nothing);
@@ -1782,7 +1803,7 @@ pub fn render_all() -> AppResult<()> {
     STATE.with(|cell| -> AppResult<()> {
         let borrowed = cell.borrow();
         let app = borrowed.as_ref().ok_or("Interface ausente")?;
-        let preview = path_cstring(&preview)?;
+        let preview = rustpdf::path_to_cstring(&preview)?;
         unsafe {
             gtk_widget_set_visible(app.ui.welcome, 0);
             gtk_image_set_from_file(app.image, preview.as_ptr());
@@ -1836,7 +1857,8 @@ fn render_empty() {
             clear_children(app.ui.comments_box);
         }
     });
-    THUMB_JOB.store(0, std::sync::atomic::Ordering::SeqCst);
+    // Descartar a tarefa de miniaturas a cancela.
+    THUMB_TASK.with(|cell| *cell.borrow_mut() = None);
     with_widgets(|ui| {
         ui.thumbs_state = None;
         ui.comments_key = None;
@@ -1845,15 +1867,12 @@ fn render_empty() {
     });
 }
 
-/// Trabalho de miniaturas ativo; trabalhos antigos param ao ver outro número.
-static THUMB_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Miniaturas prontas (`página`, arquivo) de um trabalho, e a pasta dele.
-type ThumbReceiver = (std::sync::mpsc::Receiver<(usize, PathBuf)>, PathBuf);
+/// Tarefa de miniaturas (`página`, arquivo) e a pasta dela.
+type ThumbTask = (Job<(usize, PathBuf)>, PathBuf);
 
 thread_local! {
-    /// Receptor do trabalho de miniaturas ativo.
-    static THUMB_RECEIVER: RefCell<Option<ThumbReceiver>> = const { RefCell::new(None) };
+    /// Tarefa de miniaturas ativa; trocá-la ou descartá-la cancela a anterior.
+    static THUMB_TASK: RefCell<Option<ThumbTask>> = const { RefCell::new(None) };
 }
 
 /// Miniaturas sem travar a janela: os botões existem desde já (com a
@@ -1974,56 +1993,32 @@ fn build_thumbnail_buttons(container: *mut c_void, pages: usize) {
 }
 
 /// Gera as miniaturas de `pages` numa thread (atual primeiro, depois em lotes).
-fn start_thumbnail_job(current: usize, mut pages: Vec<usize>) -> AppResult<()> {
-    use std::sync::atomic::Ordering;
+fn start_thumbnail_job(current: usize, pages: Vec<usize>) -> AppResult<()> {
     let (source, directory) = with_session(|session| session.thumbnail_source())?;
-    let job = THUMB_JOB.fetch_add(1, Ordering::SeqCst) + 1;
-    pages.sort_unstable();
-    // Lotes de páginas consecutivas: a atual sozinha, depois o resto.
-    let mut batches: Vec<(usize, usize)> = Vec::new();
-    if pages.contains(&current) {
-        batches.push((current, current));
-    }
-    for number in pages.into_iter().filter(|number| *number != current) {
-        match batches.last_mut() {
-            Some((first, last))
-                if *last + 1 == number && *last - *first < 7 && *first != current =>
-            {
-                *last = number
-            }
-            _ => batches.push((number, number)),
-        }
-    }
-    let (sender, receiver) = std::sync::mpsc::channel();
+    let batches = rustpdf::apresentacao::miniaturas::batches(current, &pages);
     let worker_directory = directory.clone();
-    std::thread::spawn(move || {
-        let mut cancelled = false;
-        for (first, last) in batches {
-            if THUMB_JOB.load(Ordering::SeqCst) != job {
-                cancelled = true;
+    let job = Job::spawn(move |worker| {
+        'batches: for (first, last) in batches {
+            if worker.cancelled() {
                 break;
             }
             match rustpdf::render_thumbnails(&source, &worker_directory, first, last, THUMB_WIDTH) {
                 Ok(produced) => {
                     for item in produced {
-                        if sender.send(item).is_err() {
-                            cancelled = true;
-                            break;
+                        if !worker.send(item) {
+                            break 'batches;
                         }
                     }
                 }
                 Err(_) => break,
             }
-            if cancelled {
-                break;
-            }
         }
         let _ = fs::remove_file(&source);
-        if cancelled {
+        if worker.cancelled() {
             let _ = fs::remove_dir_all(&worker_directory);
         }
     });
-    THUMB_RECEIVER.with(|cell| *cell.borrow_mut() = Some((receiver, directory)));
+    THUMB_TASK.with(|cell| *cell.borrow_mut() = Some((job, directory)));
     let start_polling =
         with_widgets(|ui| !std::mem::replace(&mut ui.thumb_polling, true)).unwrap_or(false);
     if start_polling {
@@ -2032,31 +2027,102 @@ fn start_thumbnail_job(current: usize, mut pages: Vec<usize>) -> AppResult<()> {
     Ok(())
 }
 
-/// Troca as imagens das miniaturas que ficaram prontas (thread principal).
-unsafe extern "C" fn poll_thumbnails(_data: *mut c_void) -> c_int {
-    use std::sync::mpsc::TryRecvError;
-    let images = with_widgets(|ui| ui.thumb_images.clone()).unwrap_or_default();
-    let finished = THUMB_RECEIVER.with(|cell| {
+/// Exportação em segundo plano: resultado (arquivos ou erro) e a cópia
+/// do documento usada, apagada ao terminar.
+type ExportTask = (Job<ExportEvent>, PathBuf, ExportFormat);
+
+/// Mensagens da tarefa de exportação para a interface.
+enum ExportEvent {
+    /// Página `feitas` de `total` começando.
+    Page(usize, usize),
+    Done(Result<Vec<PathBuf>, String>),
+}
+
+thread_local! {
+    static EXPORT_TASK: RefCell<Option<ExportTask>> = const { RefCell::new(None) };
+}
+
+/// Pede para a exportação em andamento parar (na próxima página).
+pub fn cancel_export() -> bool {
+    EXPORT_TASK.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|(job, _, _)| job.cancel())
+            .is_some()
+    })
+}
+
+pub fn export_running() -> bool {
+    EXPORT_TASK.with(|cell| cell.borrow().is_some())
+}
+
+/// Exporta `snapshot` numa thread; a barra de status mostra o resultado.
+pub fn start_export(snapshot: PathBuf, total_pages: usize, request: ExportRequest) {
+    let source = snapshot.clone();
+    let format = request.format;
+    let job = Job::spawn(move |worker| {
+        // Cancelar (ou fechar a janela) faz o próximo envio falhar e para a exportação.
+        let progress = |done: usize, total: usize| worker.send(ExportEvent::Page(done, total));
+        let result =
+            rustpdf::infra::exportacao::export_to_files(&source, total_pages, &request, &progress);
+        worker.send(ExportEvent::Done(result));
+    });
+    EXPORT_TASK.with(|cell| *cell.borrow_mut() = Some((job, snapshot, format)));
+    unsafe { g_timeout_add(150, poll_export, ptr::null_mut()) };
+}
+
+unsafe extern "C" fn poll_export(_data: *mut c_void) -> c_int {
+    let finished = EXPORT_TASK.with(|cell| {
         let mut slot = cell.borrow_mut();
-        let Some((receiver, directory)) = slot.as_ref() else {
+        let Some((job, snapshot, format)) = slot.as_ref() else {
             return true;
         };
-        loop {
-            match receiver.try_recv() {
-                Ok((page, path)) => {
-                    if let (Some(image), Ok(file)) = (images.get(page - 1), path_cstring(&path)) {
-                        gtk_image_set_from_file(*image, file.as_ptr());
-                    }
-                    let _ = fs::remove_file(&path);
+        let progress = job.poll();
+        for event in progress.items {
+            match event {
+                ExportEvent::Page(done, total) => status(
+                    &rustpdf::apresentacao::exportacao::progress_message(*format, done, total),
+                ),
+                ExportEvent::Done(Ok(files)) => {
+                    status(&rustpdf::apresentacao::exportacao::done_message(&files))
                 }
-                Err(TryRecvError::Empty) => return false,
-                Err(TryRecvError::Disconnected) => {
-                    let _ = fs::remove_dir_all(directory);
-                    *slot = None;
-                    return true;
-                }
+                ExportEvent::Done(Err(error)) => status(&format!("Exportação: {error}")),
             }
         }
+        if progress.finished {
+            // Cancelada, a tarefa não consegue mais enviar o resultado.
+            if job.cancelled() {
+                status("Exportação cancelada");
+            }
+            let _ = fs::remove_file(snapshot);
+            *slot = None;
+        }
+        progress.finished
+    });
+    c_int::from(!finished)
+}
+
+/// Troca as imagens das miniaturas que ficaram prontas (thread principal).
+unsafe extern "C" fn poll_thumbnails(_data: *mut c_void) -> c_int {
+    let images = with_widgets(|ui| ui.thumb_images.clone()).unwrap_or_default();
+    let finished = THUMB_TASK.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some((job, directory)) = slot.as_ref() else {
+            return true;
+        };
+        let progress = job.poll();
+        for (page, path) in progress.items {
+            if let (Some(image), Ok(file)) = (images.get(page - 1), rustpdf::path_to_cstring(&path))
+            {
+                gtk_image_set_from_file(*image, file.as_ptr());
+            }
+            let _ = fs::remove_file(&path);
+        }
+        if progress.finished {
+            let _ = fs::remove_dir_all(directory);
+            *slot = None;
+        }
+        progress.finished
     });
     if finished {
         with_widgets(|ui| ui.thumb_polling = false);
@@ -2153,26 +2219,6 @@ const WEBSITE: &str = "https://github.com/wbaamaral/rustpdf";
 /// `GTK_LICENSE_AGPL_3_0` (AGPL-3.0 ou posterior).
 const LICENSE_AGPL_3_0_OR_LATER: c_int = 13;
 
-/// Primeira linha da saída de uma ferramenta (`stdout` ou `stderr`), ou "não encontrado".
-fn tool_version(program: &str, args: &[&str]) -> String {
-    rustpdf::tool_command(program)
-        .args(args)
-        .output()
-        .ok()
-        .and_then(|output| {
-            let text = if output.stdout.is_empty() {
-                output.stderr
-            } else {
-                output.stdout
-            };
-            String::from_utf8_lossy(&text)
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .map(|line| line.trim().to_string())
-        })
-        .unwrap_or_else(|| "não encontrado".into())
-}
-
 /// Bibliotecas e programas usados, com licença e página do projeto (o GTK
 /// transforma "Nome https://…" em link). Mantida em sincronia com TERCEIROS.md.
 const LIBRARIES: &[&str] = &[
@@ -2198,19 +2244,15 @@ pub fn component_versions() -> Vec<String> {
             gtk_get_micro_version(),
         )
     };
-    let qpdf = unsafe {
-        let pointer = qpdf_get_qpdf_version();
-        if pointer.is_null() {
-            "?".to_string()
-        } else {
-            CStr::from_ptr(pointer).to_string_lossy().into_owned()
-        }
-    };
+    let qpdf = rustpdf::infra::qpdf::version();
     vec![
         format!("GTK {major}.{minor}.{micro}"),
         format!("qpdf {qpdf}"),
-        format!("Poppler: {}", tool_version("pdftoppm", &["-v"])),
-        format!("Tesseract: {}", tool_version("tesseract", &["--version"])),
+        format!("Poppler: {}", rustpdf::tool_version("pdftoppm", &["-v"])),
+        format!(
+            "Tesseract: {}",
+            rustpdf::tool_version("tesseract", &["--version"])
+        ),
     ]
 }
 

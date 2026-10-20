@@ -4,12 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const PNG: &[u8] = &[
-    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 6, 0,
-    0, 0, 114, 182, 13, 36, 0, 0, 0, 18, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240, 31, 12,
-    129, 52, 24, 0, 0, 73, 200, 9, 247, 249, 171, 182, 13, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
-    130,
-];
+use rustpdf::testkit::{PdfBuilder, TempDir, PNG_2X2 as PNG};
 
 /// Executa a CLI; devolve (sucesso, stdout, stderr).
 fn cli(args: &[&str]) -> (bool, String, String) {
@@ -52,11 +47,8 @@ fn assert_close(got: &[f64], want: &[f64], tolerance: f64) {
     }
 }
 
-fn workspace(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("rustpdf-cli-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir(&root).unwrap();
-    root
+fn workspace(name: &str) -> TempDir {
+    TempDir::new(&format!("cli-{name}"))
 }
 
 fn path(root: &Path, name: &str) -> String {
@@ -65,14 +57,15 @@ fn path(root: &Path, name: &str) -> String {
 
 #[test]
 fn selects_moves_resizes_and_rotates_objects() {
-    let root = workspace("objects");
+    let dir = workspace("objects");
+    let root = dir.path();
     let (blank, image_pdf, text_pdf, base) = (
-        path(&root, "blank.pdf"),
-        path(&root, "image.pdf"),
-        path(&root, "text.pdf"),
-        path(&root, "base.pdf"),
+        path(root, "blank.pdf"),
+        path(root, "image.pdf"),
+        path(root, "text.pdf"),
+        path(root, "base.pdf"),
     );
-    let png = path(&root, "pixels.png");
+    let png = path(root, "pixels.png");
     fs::write(&png, PNG).unwrap();
     ok(&["new", &blank]);
     ok(&[
@@ -108,7 +101,7 @@ fn selects_moves_resizes_and_rotates_objects() {
     assert_eq!(property(&image, "giravel"), "sim");
 
     // Redimensionar em torno do centro (175, 560) e girar 90°.
-    let resized = path(&root, "resized.pdf");
+    let resized = path(root, "resized.pdf");
     ok(&[
         "resize-object",
         &base,
@@ -125,7 +118,7 @@ fn selects_moves_resizes_and_rotates_objects() {
         &[25.0, 530.0, 325.0, 590.0],
         0.5,
     );
-    let rotated = path(&root, "rotated.pdf");
+    let rotated = path(root, "rotated.pdf");
     ok(&["rotate-object", &resized, &rotated, "1", "175", "560", "90"]);
     let after = ok(&["select", &rotated, "1", "175", "560"]);
     assert_close(
@@ -142,7 +135,7 @@ fn selects_moves_resizes_and_rotates_objects() {
     let (success, _, stderr) = cli(&[
         "resize-object",
         &rotated,
-        &path(&root, "x.pdf"),
+        &path(root, "x.pdf"),
         "1",
         "115",
         "306",
@@ -150,7 +143,7 @@ fn selects_moves_resizes_and_rotates_objects() {
         "1",
     ]);
     assert!(!success && stderr.contains("proporcionalmente"), "{stderr}");
-    let moved = path(&root, "moved.pdf");
+    let moved = path(root, "moved.pdf");
     ok(&[
         "move-object",
         &rotated,
@@ -163,7 +156,7 @@ fn selects_moves_resizes_and_rotates_objects() {
     ]);
     let text = ok(&["select", &moved, "1", "115", "206"]);
     assert_eq!(property(&text, "rotulo"), "Texto “Girar”");
-    let turned = path(&root, "turned.pdf");
+    let turned = path(root, "turned.pdf");
     ok(&["rotate-object", &moved, &turned, "1", "115", "206", "30"]);
     let center = numbers(&property(&text, "caixa"));
     let (cx, cy) = ((center[0] + center[2]) / 2.0, (center[1] + center[3]) / 2.0);
@@ -174,7 +167,7 @@ fn selects_moves_resizes_and_rotates_objects() {
     let (success, _, stderr) = cli(&[
         "rotate-object",
         &turned,
-        &path(&root, "x.pdf"),
+        &path(root, "x.pdf"),
         "1",
         "410",
         "710",
@@ -184,7 +177,7 @@ fn selects_moves_resizes_and_rotates_objects() {
         !success && stderr.contains("não pode ser girado"),
         "{stderr}"
     );
-    let final_pdf = path(&root, "final.pdf");
+    let final_pdf = path(root, "final.pdf");
     ok(&[
         "move-object",
         &turned,
@@ -199,7 +192,7 @@ fn selects_moves_resizes_and_rotates_objects() {
     assert!(property(&note, "tipo").starts_with("anotacao:nota"));
 
     // Matriz genérica e saída válida.
-    let matrix = path(&root, "matrix.pdf");
+    let matrix = path(root, "matrix.pdf");
     ok(&[
         "transform-object",
         &final_pdf,
@@ -226,62 +219,25 @@ fn selects_moves_resizes_and_rotates_objects() {
 
     let (success, _, stderr) = cli(&["select", &final_pdf, "1", "500", "100"]);
     assert!(!success && stderr.contains("Nenhum objeto"), "{stderr}");
-    let _ = fs::remove_dir_all(root);
-}
-
-/// PDF mínimo com xref correta a partir dos corpos dos objetos (1, 2, …).
-fn write_pdf(path: &str, objects: &[String]) {
-    let mut bytes = b"%PDF-1.4\n".to_vec();
-    let mut offsets = Vec::new();
-    for (index, body) in objects.iter().enumerate() {
-        offsets.push(bytes.len());
-        bytes.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", index + 1).as_bytes());
-    }
-    let xref = bytes.len();
-    bytes.extend_from_slice(
-        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
-    );
-    for offset in offsets {
-        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-    }
-    bytes.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
-            objects.len() + 1
-        )
-        .as_bytes(),
-    );
-    fs::write(path, bytes).unwrap();
-}
-
-fn stream(dictionary: &str, data: &str) -> String {
-    format!(
-        "<< {dictionary} /Length {} >>\nstream\n{data}\nendstream",
-        data.len()
-    )
 }
 
 #[test]
 fn image_commands_act_on_chosen_occurrences() {
-    let root = workspace("image-occurrences");
-    let input = path(&root, "shared.pdf");
-    let resources = "/Resources << /XObject << /Im1 5 0 R >> >>";
-    write_pdf(
-        &input,
-        &[
-            "<< /Type /Catalog /Pages 2 0 R >>".into(),
-            "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>".into(),
-            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] {resources} /Contents 4 0 R >>"),
-            stream("", "q 100 0 0 50 10 20 cm /Im1 Do Q q 100 0 0 50 10 200 cm /Im1 Do Q"),
-            stream(
-                "/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8",
-                "abc",
-            ),
-            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] {resources} /Contents 7 0 R >>"),
-            stream("", "q 100 0 0 50 10 20 cm /Im1 Do Q"),
-        ],
+    let dir = workspace("image-occurrences");
+    let root = dir.path();
+    let input = path(root, "shared.pdf");
+    let mut pdf = PdfBuilder::new();
+    let image = pdf.image_rgb(1, 1, b"abc");
+    let resources = format!("/XObject << /Im1 {image} >>");
+    pdf.page(
+        595.0,
+        842.0,
+        &resources,
+        "q 100 0 0 50 10 20 cm /Im1 Do Q q 100 0 0 50 10 200 cm /Im1 Do Q",
     );
-    let png = path(&root, "pixels.png");
+    pdf.page(595.0, 842.0, &resources, "q 100 0 0 50 10 20 cm /Im1 Do Q");
+    pdf.write(Path::new(&input));
+    let png = path(root, "pixels.png");
     fs::write(&png, PNG).unwrap();
     let draws = |pdf: &str, page: &str| -> Vec<String> {
         ok(&["image-draws", pdf, page])
@@ -298,7 +254,7 @@ fn image_commands_act_on_chosen_occurrences() {
     );
 
     // Sem ocorrência: recusa e orienta; com ocorrência: só ela muda.
-    let moved = path(&root, "moved.pdf");
+    let moved = path(root, "moved.pdf");
     let (success, _, stderr) = cli(&["move-image", &input, &moved, "1", "Im1", "5", "0"]);
     assert!(
         !success && stderr.contains("informe a ocorrência"),
@@ -312,7 +268,7 @@ fn image_commands_act_on_chosen_occurrences() {
     assert!(draws(&moved, "1")[0].starts_with("Im1\t1\t10.00 20.00"));
 
     // Trocar pelo ponto: só a 1ª ocorrência aponta para a imagem nova.
-    let replaced = path(&root, "replaced.pdf");
+    let replaced = path(root, "replaced.pdf");
     ok(&["replace-image-at", &moved, &replaced, "1", "60", "45", &png]);
     let now = draws(&replaced, "1");
     assert!(
@@ -325,10 +281,10 @@ fn image_commands_act_on_chosen_occurrences() {
     );
 
     // Remover pelo ponto e depois todas as ocorrências de um nome.
-    let removed = path(&root, "removed.pdf");
+    let removed = path(root, "removed.pdf");
     ok(&["remove-image-at", &replaced, &removed, "1", "60", "225"]);
     assert_eq!(draws(&removed, "1").len(), 1);
-    let empty = path(&root, "empty.pdf");
+    let empty = path(root, "empty.pdf");
     ok(&["remove-image", &removed, &empty, "1", "Im1_c1", "todas"]);
     assert!(draws(&empty, "1").is_empty());
     assert_eq!(draws(&empty, "2").len(), 1, "a página 2 mantém a imagem");
@@ -341,5 +297,370 @@ fn image_commands_act_on_chosen_occurrences() {
         "{}",
         String::from_utf8_lossy(&check.stdout)
     );
-    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn export_markdown_keeps_headings_paragraphs_and_lists() {
+    let dir = workspace("export-md");
+    let root = dir.path();
+    let input = path(root, "relatorio.pdf");
+    let mut pdf = PdfBuilder::new();
+    pdf.text_page(&[
+        (72.0, 760.0, 28.0, "Relatorio anual"),
+        (72.0, 700.0, 12.0, "O ano teve bons resultados."),
+        (72.0, 660.0, 12.0, "* Receita maior"),
+        (72.0, 645.0, 12.0, "* Custos menores"),
+    ]);
+    pdf.text_page(&[(72.0, 760.0, 12.0, "Segunda pagina.")]);
+    pdf.write(Path::new(&input));
+
+    let output = path(root, "relatorio.md");
+    ok(&["export", &input, &output]);
+    assert_eq!(
+        fs::read_to_string(&output).unwrap(),
+        "# Relatorio anual\n\nO ano teve bons resultados.\n\n- Receita maior\n- Custos menores\n\nSegunda pagina.\n"
+    );
+
+    let second = path(root, "segunda.md");
+    ok(&["export", &input, &second, "--paginas", "2"]);
+    assert_eq!(fs::read_to_string(&second).unwrap(), "Segunda pagina.\n");
+
+    let (success, _, stderr) = cli(&["export", &input, &path(root, "x.odt")]);
+    assert!(!success && stderr.contains("não suportado"), "{stderr}");
+    let (success, _, stderr) = cli(&["export", &input, &output, "--paginas", "9"]);
+    assert!(
+        !success && stderr.contains("Página fora de 1..=2"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn export_csv_writes_each_table() {
+    let dir = workspace("export-csv");
+    let root = dir.path();
+    let input = path(root, "tabela.pdf");
+    let mut pdf = PdfBuilder::new();
+    pdf.text_page(&[
+        (72.0, 760.0, 12.0, "Estoque do mes"),
+        (72.0, 700.0, 12.0, "Produto"),
+        (250.0, 700.0, 12.0, "Qtd"),
+        (72.0, 684.0, 12.0, "Caneta azul"),
+        (250.0, 684.0, 12.0, "10"),
+        (72.0, 668.0, 12.0, "Lapis"),
+        (250.0, 668.0, 12.0, "3"),
+    ]);
+    pdf.text_page(&[(72.0, 760.0, 12.0, "Sem tabela aqui.")]);
+    pdf.write(Path::new(&input));
+
+    let output = path(root, "estoque.csv");
+    ok(&["export", &input, &output, "--paginas", "1"]);
+    assert_eq!(
+        fs::read_to_string(&output).unwrap(),
+        "\u{feff}Produto;Qtd\r\nCaneta azul;10\r\nLapis;3\r\n"
+    );
+    let comma = path(root, "virgula.csv");
+    ok(&["export", &input, &comma, "--separador", ",", "--sem-bom"]);
+    assert_eq!(
+        fs::read_to_string(&comma).unwrap(),
+        "Produto,Qtd\r\nCaneta azul,10\r\nLapis,3\r\n"
+    );
+    let markdown = path(root, "estoque.md");
+    ok(&["export", &input, &markdown, "--paginas", "1"]);
+    assert!(fs::read_to_string(&markdown)
+        .unwrap()
+        .contains("| Produto     | Qtd |\n| ----------- | --- |\n| Caneta azul | 10  |"));
+
+    let (success, _, stderr) = cli(&["export", &input, &path(root, "nada.csv"), "--paginas", "2"]);
+    assert!(!success && stderr.contains("Nenhuma tabela"), "{stderr}");
+}
+
+#[test]
+fn export_xlsx_opens_in_libreoffice() {
+    let dir = workspace("export-xlsx");
+    let root = dir.path();
+    let input = path(root, "tabela.pdf");
+    let mut pdf = PdfBuilder::new();
+    pdf.text_page(&[
+        (72.0, 700.0, 12.0, "Produto"),
+        (250.0, 700.0, 12.0, "Valor"),
+        (72.0, 684.0, 12.0, "Caneta azul"),
+        (250.0, 684.0, 12.0, "1.234,50"),
+        (72.0, 668.0, 12.0, "Lapis"),
+        (250.0, 668.0, 12.0, "3"),
+    ]);
+    pdf.write(Path::new(&input));
+    let output = path(root, "tabela.xlsx");
+    ok(&["export", &input, &output]);
+    assert!(fs::read(&output).unwrap().starts_with(b"PK\x03\x04"));
+
+    // Abre de fato num programa de planilhas, quando houver um.
+    let profile = format!(
+        "-env:UserInstallation=file://{}",
+        root.join("perfil").display()
+    );
+    let Ok(converted) = Command::new("soffice")
+        .args([&profile, "--headless", "--convert-to", "csv", "--outdir"])
+        .arg(root)
+        .arg(&output)
+        .output()
+    else {
+        return; // sem LibreOffice neste sistema
+    };
+    assert!(
+        converted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&converted.stderr)
+    );
+    let csv = fs::read_to_string(root.join("tabela.csv")).unwrap();
+    // O valor chega como número (formatado pela localidade), não como o
+    // texto "1.234,50" do PDF.
+    let lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(lines[0], "Produto,Valor");
+    assert!(
+        ["Caneta azul,1234.5", "Caneta azul,\"1234,5\""].contains(&lines[1]),
+        "{csv}"
+    );
+    assert_eq!(lines[2], "Lapis,3");
+}
+
+#[test]
+fn export_docx_opens_in_libreoffice() {
+    let dir = workspace("export-docx");
+    let root = dir.path();
+    let input = path(root, "relatorio.pdf");
+    let mut pdf = PdfBuilder::new();
+    pdf.text_page(&[
+        (72.0, 760.0, 28.0, "Relatorio anual"),
+        (72.0, 700.0, 12.0, "O ano teve bons resultados."),
+        (72.0, 660.0, 12.0, "* Receita maior"),
+        (72.0, 620.0, 12.0, "Produto"),
+        (250.0, 620.0, 12.0, "Qtd"),
+        (72.0, 604.0, 12.0, "Caneta"),
+        (250.0, 604.0, 12.0, "10"),
+    ]);
+    pdf.write(Path::new(&input));
+    let output = path(root, "relatorio.docx");
+    ok(&["export", &input, &output]);
+    assert!(fs::read(&output).unwrap().starts_with(b"PK\x03\x04"));
+
+    let profile = format!(
+        "-env:UserInstallation=file://{}",
+        root.join("perfil").display()
+    );
+    let Ok(converted) = Command::new("soffice")
+        .args([
+            &profile,
+            "--headless",
+            "--convert-to",
+            "txt:Text (encoded):UTF8",
+            "--outdir",
+        ])
+        .arg(root)
+        .arg(&output)
+        .output()
+    else {
+        return; // sem LibreOffice neste sistema
+    };
+    assert!(
+        converted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&converted.stderr)
+    );
+    let text = fs::read_to_string(root.join("relatorio.txt")).unwrap();
+    let order = [
+        "Relatorio anual",
+        "O ano teve bons resultados.",
+        "Receita maior",
+        "Produto",
+        "Qtd",
+        "Caneta",
+        "10",
+    ];
+    let mut from = 0;
+    for expected in order {
+        let at = text[from..]
+            .find(expected)
+            .unwrap_or_else(|| panic!("{expected:?} fora de ordem em:\n{text}"));
+        from += at + expected.len();
+    }
+}
+
+#[test]
+fn export_includes_images_in_markdown_and_word() {
+    let dir = workspace("export-imagens");
+    let root = dir.path();
+    let input = path(root, "figura.pdf");
+    let mut pdf = PdfBuilder::new();
+    let font = pdf.helvetica();
+    let image = pdf.image_rgb(2, 2, &[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]);
+    pdf.page(
+        595.0,
+        842.0,
+        &format!("/Font << /F1 {font} >> /XObject << /Im {image} >>"),
+        "BT /F1 12 Tf 1 0 0 1 72 760 Tm (Legenda acima.) Tj ET q 200 0 0 100 72 600 cm /Im Do Q",
+    );
+    pdf.write(Path::new(&input));
+
+    let markdown = path(root, "figura.md");
+    ok(&["export", &input, &markdown]);
+    assert_eq!(
+        fs::read_to_string(&markdown).unwrap(),
+        "Legenda acima.\n\n![Imagem da página 1](figura_arquivos/p1-i1.png)\n"
+    );
+    let png = fs::read(root.join("figura_arquivos/p1-i1.png")).unwrap();
+    // 200 × 100 pt a 150 dpi.
+    assert_eq!(rustpdf::infra::png::dimensions(&png), Some((417, 208)));
+
+    let plain = path(root, "sem.md");
+    ok(&["export", &input, &plain, "--sem-imagens"]);
+    assert_eq!(fs::read_to_string(&plain).unwrap(), "Legenda acima.\n");
+
+    let word = path(root, "figura.docx");
+    ok(&["export", &input, &word]);
+    let profile = format!(
+        "-env:UserInstallation=file://{}",
+        root.join("perfil").display()
+    );
+    let Ok(converted) = Command::new("soffice")
+        .args([&profile, "--headless", "--convert-to", "pdf", "--outdir"])
+        .arg(root.join("impresso"))
+        .arg(&word)
+        .output()
+    else {
+        return; // sem LibreOffice neste sistema
+    };
+    assert!(converted.status.success());
+    let printed = root.join("impresso/figura.pdf");
+    let list = Command::new("pdfimages")
+        .arg("-list")
+        .arg(&printed)
+        .output()
+        .unwrap();
+    let images = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .count()
+        .saturating_sub(2);
+    assert_eq!(images, 1, "{}", String::from_utf8_lossy(&list.stdout));
+}
+
+#[test]
+fn export_pptx_editable_and_faithful() {
+    let dir = workspace("export-pptx");
+    let root = dir.path();
+    let input = path(root, "slides.pdf");
+    let mut pdf = PdfBuilder::new();
+    pdf.text_page(&[
+        (72.0, 760.0, 28.0, "Primeiro slide"),
+        (72.0, 700.0, 12.0, "Texto do corpo."),
+    ]);
+    pdf.text_page(&[(72.0, 760.0, 28.0, "Segundo slide")]);
+    pdf.write(Path::new(&input));
+
+    let editable = path(root, "editavel.pptx");
+    ok(&["export", &input, &editable]);
+    let faithful = path(root, "fiel.pptx");
+    ok(&["export", &input, &faithful, "--fiel"]);
+    assert!(fs::read(&editable).unwrap().starts_with(b"PK\x03\x04"));
+
+    let profile = format!(
+        "-env:UserInstallation=file://{}",
+        root.join("perfil").display()
+    );
+    let print = |file: &str| -> Option<PathBuf> {
+        let converted = Command::new("soffice")
+            .args([&profile, "--headless", "--convert-to", "pdf", "--outdir"])
+            .arg(root.join("impresso"))
+            .arg(file)
+            .output()
+            .ok()?;
+        assert!(converted.status.success());
+        let name = Path::new(file).with_extension("pdf");
+        Some(root.join("impresso").join(name.file_name().unwrap()))
+    };
+    let Some(printed) = print(&editable) else {
+        return; // sem LibreOffice neste sistema
+    };
+    let text = Command::new("pdftotext")
+        .arg(&printed)
+        .arg("-")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    for expected in ["Primeiro slide", "Texto do corpo.", "Segundo slide"] {
+        assert!(text.contains(expected), "{expected:?} em:\n{text}");
+    }
+    let printed = print(&faithful).unwrap();
+    let list = Command::new("pdfimages")
+        .arg("-list")
+        .arg(&printed)
+        .output()
+        .unwrap();
+    let images = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .count()
+        .saturating_sub(2);
+    assert_eq!(images, 2, "uma imagem por slide");
+}
+
+#[test]
+fn export_reads_scanned_pages_with_ocr() {
+    let dir = workspace("export-ocr");
+    let root = dir.path();
+    // Página com texto, renderizada e embutida só como imagem (digitalizada).
+    let original = path(root, "original.pdf");
+    let mut pdf = PdfBuilder::new();
+    pdf.text_page(&[
+        (72.0, 700.0, 40.0, "RUSTPDF testa"),
+        (72.0, 600.0, 40.0, "OCR aqui"),
+    ]);
+    pdf.write(Path::new(&original));
+    ok(&["png", &original, &path(root, "pagina.png"), "1"]);
+    let png = fs::read(root.join("pagina.png")).unwrap();
+    let (width, height, rgb) = rustpdf::infra::png::decode(&png, 50_000_000).unwrap();
+    let scanned = path(root, "digitalizado.pdf");
+    let mut pdf = PdfBuilder::new();
+    let image = pdf.image_rgb(width, height, &rgb);
+    pdf.page(
+        595.0,
+        842.0,
+        &format!("/XObject << /Im {image} >>"),
+        "q 595 0 0 842 0 0 cm /Im Do Q",
+    );
+    pdf.write(Path::new(&scanned));
+
+    let output = path(root, "lido.md");
+    let (success, _, stderr) = cli(&["export", &scanned, &output, "--sem-imagens"]);
+    assert!(
+        !success && stderr.contains("OCR"),
+        "sem texto: orienta o OCR ({stderr})"
+    );
+    ok(&["export", &scanned, &output, "--sem-imagens", "--ocr", "eng"]);
+    let text = fs::read_to_string(&output).unwrap();
+    assert!(text.contains("RUSTPDF") && text.contains("OCR"), "{text}");
+}
+
+#[test]
+fn ruled_table_with_long_cells_exports_to_csv() {
+    let dir = workspace("export-grade");
+    let root = dir.path();
+    let input = path(root, "grade.pdf");
+    let mut pdf = PdfBuilder::new();
+    let font = pdf.helvetica();
+    // Grade 2 × 2 (linhas em 700, 680, 660; colunas em 70, 150, 500) e texto longo.
+    let content = concat!(
+        "70 700 m 500 700 l 70 680 m 500 680 l 70 660 m 500 660 l ",
+        "70 660 m 70 700 l 150 660 m 150 700 l 500 660 m 500 700 l S ",
+        "BT /F1 10 Tf 1 0 0 1 75 686 Tm (Codigo) Tj ET ",
+        "BT /F1 10 Tf 1 0 0 1 155 686 Tm (Descricao do item) Tj ET ",
+        "BT /F1 10 Tf 1 0 0 1 75 666 Tm (A-10) Tj ET ",
+        "BT /F1 10 Tf 1 0 0 1 155 666 Tm (Caneta azul de ponta fina para escrita diaria) Tj ET"
+    );
+    pdf.page(595.0, 842.0, &format!("/Font << /F1 {font} >>"), content);
+    pdf.write(Path::new(&input));
+    let output = path(root, "grade.csv");
+    ok(&["export", &input, &output, "--sem-bom"]);
+    assert_eq!(
+        fs::read_to_string(&output).unwrap(),
+        "Codigo;Descricao do item\r\nA-10;Caneta azul de ponta fina para escrita diaria\r\n"
+    );
 }

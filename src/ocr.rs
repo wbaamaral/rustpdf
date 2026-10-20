@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use crate::dominio::layout::Page;
 use crate::{write_one_page_pdf, AppResult};
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
-
-fn png_dimensions(path: &Path) -> AppResult<(f64, f64)> {
-    let mut file = File::open(path).map_err(|e| format!("Imagem OCR inacessível: {e}"))?;
-    let mut header = [0u8; 24];
-    file.read_exact(&mut header)
-        .map_err(|e| format!("Cabeçalho PNG inválido: {e}"))?;
-    if &header[..8] != b"\x89PNG\r\n\x1a\n" || &header[12..16] != b"IHDR" {
-        return Err("Imagem OCR não é PNG".into());
-    }
-    let width = u32::from_be_bytes(header[16..20].try_into().unwrap());
-    let height = u32::from_be_bytes(header[20..24].try_into().unwrap());
-    if width == 0 || height == 0 {
-        return Err("Imagem OCR vazia".into());
-    }
-    Ok((width as f64, height as f64))
-}
 
 pub(crate) fn pdf_text(text: &str) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -45,12 +28,14 @@ pub(crate) fn pdf_text(text: &str) -> Vec<u8> {
     bytes
 }
 
+/// PDF de uma página com o texto reconhecido invisível (modo 3) sobre as
+/// posições das palavras. `recognized` vem do OCR em pixels da imagem da
+/// página; as caixas são levadas para pontos de `page_width` × `page_height`.
 pub fn write_searchable_overlay(
-    image: &Path,
+    recognized: &Page,
     destination: &Path,
     page_width: f64,
     page_height: f64,
-    tsv: &str,
 ) -> AppResult<usize> {
     if !page_width.is_finite()
         || !page_height.is_finite()
@@ -59,43 +44,19 @@ pub fn write_searchable_overlay(
     {
         return Err("Dimensões da página inválidas".into());
     }
-    let (image_width, image_height) = png_dimensions(image)?;
+    let scale_x = page_width / recognized.width;
+    let scale_y = page_height / recognized.height;
     let mut stream = Vec::new();
     let mut words = 0;
-    for line in tsv.lines().skip(1) {
-        let columns: Vec<&str> = line.splitn(12, '\t').collect();
-        if columns.len() != 12 || columns[0] != "5" {
-            continue;
-        }
-        let word = columns[11].trim();
-        if word.is_empty() {
-            continue;
-        }
-        let (Ok(left), Ok(top), Ok(width), Ok(height)) = (
-            columns[6].parse::<f64>(),
-            columns[7].parse::<f64>(),
-            columns[8].parse::<f64>(),
-            columns[9].parse::<f64>(),
-        ) else {
-            continue;
-        };
-        if [left, top, width, height].iter().any(|v| !v.is_finite())
-            || left < 0.0
-            || top < 0.0
-            || width <= 0.0
-            || height <= 0.0
-            || left + width > image_width
-            || top + height > image_height
-        {
-            continue;
-        }
-        let x = left / image_width * page_width;
-        let y = page_height - (top + height) / image_height * page_height;
-        let font_size = (height / image_height * page_height).clamp(1.0, 200.0);
+    for word in recognized.words() {
+        let rect = word.rect;
+        let x = rect.left() * scale_x;
+        let y = page_height - rect.bottom() * scale_y;
+        let font_size = (rect.height() * scale_y).clamp(1.0, 200.0);
         stream.extend_from_slice(
             format!("BT /F1 {font_size:.3} Tf 3 Tr 1 0 0 1 {x:.3} {y:.3} Tm (").as_bytes(),
         );
-        stream.extend_from_slice(&pdf_text(word));
+        stream.extend_from_slice(&pdf_text(&word.text));
         stream.extend_from_slice(b") Tj ET\n");
         words += 1;
     }

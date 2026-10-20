@@ -8,150 +8,10 @@
 //! [`TextRunPlacement`], com posição em pontos da página e os trechos de
 //! bytes necessários para reescrever o conteúdo.
 
-/// Matriz afim do PDF `[a b c d e f]` (convenção de vetor-linha).
-pub type Matrix = [f64; 6];
-
-pub const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-
-/// `first × second`: aplica `first` e depois `second`.
-pub fn multiply(first: &Matrix, second: &Matrix) -> Matrix {
-    [
-        first[0] * second[0] + first[1] * second[2],
-        first[0] * second[1] + first[1] * second[3],
-        first[2] * second[0] + first[3] * second[2],
-        first[2] * second[1] + first[3] * second[3],
-        first[4] * second[0] + first[5] * second[2] + second[4],
-        first[4] * second[1] + first[5] * second[3] + second[5],
-    ]
-}
-
-/// Converte um deslocamento no espaço da página para o espaço local da matriz.
-fn local_delta(ctm: &Matrix, dx: f64, dy: f64) -> Option<(f64, f64)> {
-    let determinant = ctm[0] * ctm[3] - ctm[1] * ctm[2];
-    if determinant.abs() < 1e-12 || !determinant.is_finite() {
-        return None;
-    }
-    Some((
-        (dx * ctm[3] - dy * ctm[2]) / determinant,
-        (dy * ctm[0] - dx * ctm[1]) / determinant,
-    ))
-}
-
-/// Inversa da matriz afim, se não for degenerada.
-pub fn invert(matrix: &Matrix) -> Option<Matrix> {
-    let [a, b, c, d, e, f] = *matrix;
-    let determinant = a * d - b * c;
-    if determinant.abs() < 1e-12 || !determinant.is_finite() {
-        return None;
-    }
-    Some([
-        d / determinant,
-        -b / determinant,
-        -c / determinant,
-        a / determinant,
-        (c * f - d * e) / determinant,
-        (b * e - a * f) / determinant,
-    ])
-}
-
-pub fn translation(dx: f64, dy: f64) -> Matrix {
-    [1.0, 0.0, 0.0, 1.0, dx, dy]
-}
-
-pub fn apply(matrix: &Matrix, (x, y): (f64, f64)) -> (f64, f64) {
-    (
-        x * matrix[0] + y * matrix[2] + matrix[4],
-        x * matrix[1] + y * matrix[3] + matrix[5],
-    )
-}
-
-/// `T` expressa no espaço da página, reescrita no espaço local de `ctm`:
-/// desenhar com `X cm` antes equivale a aplicar `T` depois de `ctm`.
-pub fn conjugate(ctm: &Matrix, transform: &Matrix) -> Option<Matrix> {
-    Some(multiply(&multiply(ctm, transform), &invert(ctm)?))
-}
-
-/// Moldura orientada de um objeto: `origin + s·u + t·v`, com `s, t ∈ [0, 1]`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Frame {
-    pub origin: (f64, f64),
-    pub u: (f64, f64),
-    pub v: (f64, f64),
-}
-
-impl Frame {
-    /// Moldura alinhada aos eixos a partir de `[x0, y0, x1, y1]`.
-    pub fn from_rect([x0, y0, x1, y1]: [f64; 4]) -> Self {
-        Self {
-            origin: (x0.min(x1), y0.min(y1)),
-            u: ((x1 - x0).abs(), 0.0),
-            v: (0.0, (y1 - y0).abs()),
-        }
-    }
-
-    /// Quadrado unitário levado à página por `matrix` (imagens).
-    pub fn from_matrix(matrix: &Matrix) -> Self {
-        Self {
-            origin: (matrix[4], matrix[5]),
-            u: (matrix[0], matrix[1]),
-            v: (matrix[2], matrix[3]),
-        }
-    }
-
-    pub fn matrix(&self) -> Matrix {
-        [
-            self.u.0,
-            self.u.1,
-            self.v.0,
-            self.v.1,
-            self.origin.0,
-            self.origin.1,
-        ]
-    }
-
-    /// Ponto em coordenadas locais (`s`, `t`) da moldura.
-    pub fn point(&self, s: f64, t: f64) -> (f64, f64) {
-        apply(&self.matrix(), (s, t))
-    }
-
-    /// Coordenadas locais de um ponto da página.
-    pub fn local(&self, point: (f64, f64)) -> Option<(f64, f64)> {
-        Some(apply(&invert(&self.matrix())?, point))
-    }
-
-    pub fn contains(&self, point: (f64, f64), tolerance: f64) -> bool {
-        let Some((s, t)) = self.local(point) else {
-            return false;
-        };
-        let width = self.u.0.hypot(self.u.1).max(1e-9);
-        let height = self.v.0.hypot(self.v.1).max(1e-9);
-        let (ts, tt) = (tolerance / width, tolerance / height);
-        (-ts..=1.0 + ts).contains(&s) && (-tt..=1.0 + tt).contains(&t)
-    }
-
-    pub fn transformed(&self, transform: &Matrix) -> Self {
-        Self::from_matrix(&multiply(&self.matrix(), transform))
-    }
-
-    pub fn center(&self) -> (f64, f64) {
-        self.point(0.5, 0.5)
-    }
-
-    /// Caixa alinhada aos eixos que contém a moldura.
-    pub fn bounds(&self) -> [f64; 4] {
-        let mut bounds = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
-        for (s, t) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
-            let (x, y) = self.point(s, t);
-            bounds = [
-                bounds[0].min(x),
-                bounds[1].min(y),
-                bounds[2].max(x),
-                bounds[3].max(y),
-            ];
-        }
-        bounds
-    }
-}
+use crate::dominio::geometria::local_delta;
+pub use crate::dominio::geometria::{
+    apply, conjugate, invert, multiply, translation, Frame, Matrix, Segment, IDENTITY,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Operand {
@@ -620,6 +480,9 @@ pub struct Interpreter<F: FnMut(u32, &str) -> XObject> {
     pub invocations: Vec<Option<Invocation>>,
     pub runs: Vec<TextRunPlacement>,
     pub images: Vec<ImageDraw>,
+    /// Segmentos retos pintados (traço ou preenchimento), no espaço da
+    /// página: linhas de tabelas, molduras, sublinhados.
+    pub segments: Vec<Segment>,
     depth: usize,
 }
 
@@ -632,6 +495,7 @@ impl<F: FnMut(u32, &str) -> XObject> Interpreter<F> {
             invocations: Vec::new(),
             runs: Vec::new(),
             images: Vec::new(),
+            segments: Vec::new(),
             depth: 0,
         }
     }
@@ -682,6 +546,10 @@ impl<F: FnMut(u32, &str) -> XObject> Interpreter<F> {
         let mut block_runs: Vec<usize> = Vec::new();
         let mut block_start: Option<usize> = None;
         let mut pending: Option<usize> = None;
+        // Caminho em construção: segmentos retos, ponto atual e início do subcaminho.
+        let mut path: Vec<Segment> = Vec::new();
+        let mut current: Option<(f64, f64)> = None;
+        let mut subpath_start: Option<(f64, f64)> = None;
         for operation in operations {
             let operands = &operation.operands;
             let decides = |runs: &mut Vec<TextRunPlacement>, pending: &mut Option<usize>, ok| {
@@ -689,7 +557,68 @@ impl<F: FnMut(u32, &str) -> XObject> Interpreter<F> {
                     runs[index].isolatable &= ok;
                 }
             };
+            let point = |x: usize, y: usize| -> Option<(f64, f64)> {
+                Some(apply(
+                    &state.ctm,
+                    (number(operands, x)?, number(operands, y)?),
+                ))
+            };
             match operation.operator.as_str() {
+                "m" => {
+                    current = point(0, 1);
+                    subpath_start = current;
+                }
+                "l" => {
+                    if let (Some(from), Some(to)) = (current, point(0, 1)) {
+                        path.push((from, to));
+                        current = Some(to);
+                    }
+                }
+                "c" => current = point(4, 5).or(current),
+                "v" | "y" => current = point(2, 3).or(current),
+                "h" => {
+                    if let (Some(from), Some(start)) = (current, subpath_start) {
+                        if from != start {
+                            path.push((from, start));
+                        }
+                        current = Some(start);
+                    }
+                }
+                "re" => {
+                    if let (Some(x), Some(y), Some(w), Some(h)) = (
+                        number(operands, 0),
+                        number(operands, 1),
+                        number(operands, 2),
+                        number(operands, 3),
+                    ) {
+                        let corner = |cx: f64, cy: f64| apply(&state.ctm, (cx, cy));
+                        let corners = [
+                            corner(x, y),
+                            corner(x + w, y),
+                            corner(x + w, y + h),
+                            corner(x, y + h),
+                        ];
+                        for index in 0..4 {
+                            path.push((corners[index], corners[(index + 1) % 4]));
+                        }
+                        current = Some(corners[0]);
+                        subpath_start = current;
+                    }
+                }
+                "s" | "b" | "b*" | "S" | "f" | "F" | "f*" | "B" | "B*" => {
+                    let closes = matches!(operation.operator.as_str(), "s" | "b" | "b*");
+                    if let (true, Some(from), Some(start)) = (closes, current, subpath_start) {
+                        if from != start {
+                            path.push((from, start));
+                        }
+                    }
+                    self.segments.append(&mut path);
+                    current = None;
+                }
+                "n" => {
+                    path.clear();
+                    current = None;
+                }
                 "q" => stack.push(state.clone()),
                 "Q" => {
                     if let Some(saved) = stack.pop() {
@@ -1369,6 +1298,46 @@ mod tests {
     }
 
     #[test]
+    fn painted_straight_segments_are_collected_in_page_space() {
+        let page = concat!(
+            "q 2 0 0 2 10 10 cm 0 0 m 50 0 l S Q ", // linha (escala 2×, deslocada)
+            "100 100 200 50 re f ",                 // retângulo preenchido
+            "0 0 m 30 40 l S ",                     // diagonal: não é régua
+            "300 300 m 400 300 l n ",               // só recorte: não é pintado
+            "10 500 m 10 600 l 60 600 l h B"        // caminho fechado
+        );
+        let mut interpreter = Interpreter::new(|_, _| XObject::Other);
+        interpreter.run(0, page.as_bytes().to_vec(), IDENTITY);
+        let segments = &interpreter.segments;
+        assert!(
+            segments.contains(&((10.0, 10.0), (110.0, 10.0))),
+            "{segments:?}"
+        );
+        for side in [
+            ((100.0, 100.0), (300.0, 100.0)),
+            ((300.0, 100.0), (300.0, 150.0)),
+            ((300.0, 150.0), (100.0, 150.0)),
+            ((100.0, 150.0), (100.0, 100.0)),
+        ] {
+            assert!(segments.contains(&side), "{side:?} em {segments:?}");
+        }
+        assert!(segments.contains(&((10.0, 500.0), (10.0, 600.0))));
+        assert!(
+            segments.contains(&((60.0, 600.0), (10.0, 500.0))),
+            "fechamento com h"
+        );
+        assert!(
+            !segments.iter().any(|(a, _)| *a == (300.0, 300.0)),
+            "recorte não entra"
+        );
+        assert_eq!(
+            segments.len(),
+            1 + 4 + 1 + 3,
+            "a diagonal entra; quem filtra é a tabela"
+        );
+    }
+
+    #[test]
     fn recurses_into_forms_and_skips_inline_images() {
         let page = b"q BI /W 1 /H 1 ID \x00EI\x01 EI Q q 1 0 0 1 50 60 cm /Fx1 Do Q";
         let mut interpreter = Interpreter::new(|_, name| match name {
@@ -1427,21 +1396,6 @@ mod tests {
             replace_run_text(content, &runs[0], "é").unwrap()[..20],
             b"BT 0 0 Td (\\351) Tj "[..]
         );
-    }
-
-    #[test]
-    fn frame_and_conjugate_math() {
-        let frame = Frame::from_rect([10.0, 20.0, 110.0, 70.0]);
-        assert_eq!(frame.point(1.0, 1.0), (110.0, 70.0));
-        assert!(frame.contains((60.0, 45.0), 0.0));
-        assert!(!frame.contains((200.0, 45.0), 0.0));
-        assert_eq!(frame.local((60.0, 45.0)), Some((0.5, 0.5)));
-        let scale = [2.0, 0.0, 0.0, 2.0, 0.0, 0.0];
-        let inverse = invert(&scale).unwrap();
-        assert_eq!(multiply(&scale, &inverse), IDENTITY);
-        // Com CTM 2×, transladar 10 pt na página = transladar 5 no espaço local.
-        let local = conjugate(&scale, &translation(10.0, 0.0)).unwrap();
-        assert_eq!(local, [1.0, 0.0, 0.0, 1.0, 5.0, 0.0]);
     }
 
     #[test]

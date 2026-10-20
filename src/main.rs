@@ -6,6 +6,7 @@
 mod icons;
 mod shell;
 
+use rustpdf::apresentacao::exportacao::{self, ExportFormat};
 use rustpdf::textmove::{self, IDENTITY};
 use rustpdf::{
     is_encrypted, parse_checkbox_state, AppResult, Matrix, Occurrence, PdfSession, Selection,
@@ -267,9 +268,6 @@ thread_local! { static STATE: RefCell<Option<AppState>> = const { RefCell::new(N
 fn cstring(text: &str) -> CString {
     CString::new(text).expect("string sem NUL")
 }
-fn path_cstring(path: &Path) -> AppResult<CString> {
-    rustpdf::path_to_cstring(path)
-}
 
 /// Nome de arquivo devolvido pelo GTK (bytes do sistema no Unix, UTF-8 no Windows).
 unsafe fn path_from_glib(raw: *const c_char) -> PathBuf {
@@ -301,6 +299,8 @@ enum FileKind {
     Pdf,
     Image,
     Png,
+    /// Saída de "Exportar › Documento como…".
+    Export(ExportFormat),
 }
 
 /// `(nome do filtro, extensões, tipos MIME)`, na ordem da caixa de filtros.
@@ -333,6 +333,25 @@ impl FileKind {
                 ALL,
             ],
             FileKind::Png => &[("Imagem PNG (*.png)", &["png"], &["image/png"]), ALL],
+            FileKind::Export(ExportFormat::Docx) => &[(
+                "Documento do Word (*.docx)",
+                &["docx"],
+                &["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+            )],
+            FileKind::Export(ExportFormat::Pptx) => &[(
+                "Apresentação do PowerPoint (*.pptx)",
+                &["pptx"],
+                &["application/vnd.openxmlformats-officedocument.presentationml.presentation"],
+            )],
+            FileKind::Export(ExportFormat::Xlsx) => &[(
+                "Planilha do Excel (*.xlsx)",
+                &["xlsx"],
+                &["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+            )],
+            FileKind::Export(ExportFormat::Markdown) => {
+                &[("Markdown (*.md)", &["md"], &["text/markdown"])]
+            }
+            FileKind::Export(ExportFormat::Csv) => &[("CSV (*.csv)", &["csv"], &["text/csv"])],
         }
     }
 
@@ -341,6 +360,7 @@ impl FileKind {
             FileKind::Pdf => Some("pdf"),
             FileKind::Png => Some("png"),
             FileKind::Image => None,
+            FileKind::Export(format) => Some(format.extension()),
         }
     }
 }
@@ -663,6 +683,36 @@ fn set_session(path: &Path) -> AppResult<()> {
 ///
 /// `Some(false)`: manter (padrão); `Some(true)`: remover, após confirmação
 /// explícita; `None`: cancelado.
+/// Arquivo › Exportar › Documento como…: destino, páginas e a opção do
+/// formato; a exportação roda em segundo plano sobre uma cópia.
+fn export_document(format: ExportFormat) -> AppResult<()> {
+    if shell::export_running() {
+        return Err("Já há uma exportação em andamento".into());
+    }
+    if with_session(|s| Ok(s.is_protected()))?
+        && !confirm(
+            "Este PDF está protegido por senha.\nO arquivo exportado não terá proteção. Continuar?",
+        )
+    {
+        return Ok(());
+    }
+    let title = format!("Exportar documento como {}", format.label());
+    let Some(output) = chooser(&title, true, FileKind::Export(format)) else {
+        return Ok(());
+    };
+    let Some(pages) = prompt_text_default("Páginas a exportar (vazio = todas; ex.: 1-3,7):", "")
+    else {
+        return Ok(());
+    };
+    let answer = exportacao::question(format).is_some_and(confirm);
+    let total = with_session(|s| Ok(s.pages))?;
+    let request = exportacao::request(output, format, &pages, answer, total)?;
+    let snapshot = with_session(|s| s.export_snapshot())?;
+    shell::start_export(snapshot, total, request);
+    status(&format!("Exportando para {}…", format.label()));
+    Ok(())
+}
+
 fn ask_remove_protection(action: &str) -> AppResult<Option<bool>> {
     if !with_session(|s| Ok(s.is_protected()))? {
         return Ok(Some(false));
@@ -848,6 +898,19 @@ fn dispatch(action: usize) -> AppResult<()> {
                 with_session(|s| s.export_png(&path))?;
                 status("Página exportada como PNG");
             }
+        }
+        exportacao::CANCEL_ACTION => {
+            if shell::cancel_export() {
+                status("Cancelando a exportação…");
+            } else {
+                status("Nenhuma exportação em andamento");
+            }
+        }
+        action @ 70..=74 => {
+            let Some(format) = exportacao::action_format(action) else {
+                return Ok(());
+            };
+            export_document(format)?;
         }
         13 => {
             let text = with_session(|s| s.extract_text())?;
@@ -1550,11 +1613,7 @@ fn drag_transform(
                 sx = sx.max(4.0 / width);
                 sy = sy.max(4.0 / height);
             }
-            let local = [sx, 0.0, 0.0, sy, ax * (1.0 - sx), ay * (1.0 - sy)];
-            let frame_matrix = frame.matrix();
-            let transform = textmove::invert(&frame_matrix).map_or(IDENTITY, |inverse| {
-                textmove::multiply(&textmove::multiply(&inverse, &local), &frame_matrix)
-            });
+            let transform = frame.scaling_about(sx, sy, (ax, ay));
             (
                 transform,
                 format!(
@@ -2180,5 +2239,14 @@ mod tests {
             with_extension(PathBuf::from("foto"), FileKind::Image),
             PathBuf::from("foto")
         );
+        for format in ExportFormat::ALL {
+            let kind = FileKind::Export(format);
+            assert_eq!(kind.filters()[0].1, [format.extension()], "{format:?}");
+            let named = with_extension(PathBuf::from("/tmp/saida"), kind);
+            assert_eq!(
+                named,
+                PathBuf::from(format!("/tmp/saida.{}", format.extension()))
+            );
+        }
     }
 }
