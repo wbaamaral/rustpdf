@@ -46,14 +46,14 @@ pub fn parse_export(args: &[String]) -> Result<ExportCommand, String> {
                 csv_option = true;
             }
             "--quebrar-paginas" => {
-                if format != ExportFormat::Docx {
-                    return Err("--quebrar-paginas só vale para .docx".into());
+                if !matches!(format, ExportFormat::Docx | ExportFormat::Odt) {
+                    return Err("--quebrar-paginas só vale para .docx e .odt".into());
                 }
                 command.page_breaks = true;
             }
             "--fiel" => {
-                if format != ExportFormat::Pptx {
-                    return Err("--fiel só vale para .pptx".into());
+                if !matches!(format, ExportFormat::Pptx | ExportFormat::Odg) {
+                    return Err("--fiel só vale para .pptx e .odg".into());
                 }
                 command.faithful = true;
             }
@@ -65,8 +65,11 @@ pub fn parse_export(args: &[String]) -> Result<ExportCommand, String> {
                 command.images = false;
             }
             "--sem-imagens" => {
-                if !matches!(format, ExportFormat::Markdown | ExportFormat::Docx) {
-                    return Err("--sem-imagens só vale para .md e .docx".into());
+                if !matches!(
+                    format,
+                    ExportFormat::Markdown | ExportFormat::Docx | ExportFormat::Odt
+                ) {
+                    return Err("--sem-imagens só vale para .md, .docx e .odt".into());
                 }
                 command.images = false;
             }
@@ -116,7 +119,7 @@ mod tests {
         );
         assert_eq!(
             parse_export(&args(&["a.pdf", "b.odp"])).unwrap_err(),
-            "Formato de exportação não suportado: b.odp (disponíveis: .md, .csv, .xlsx, .docx, .pptx)"
+            "Formato de exportação não suportado: b.odp (disponíveis: .md, .csv, .xlsx, .docx, .pptx, .odt, .odg)"
         );
         assert!(parse_export(&args(&["a.pdf", "sem-extensao"])).is_err());
     }
@@ -169,9 +172,14 @@ mod tests {
             (command.request.format, command.request.page_breaks),
             (ExportFormat::Docx, true)
         );
+        let odt = parse_export(&args(&["a.pdf", "b.odt", "--quebrar-paginas"])).unwrap();
+        assert_eq!(
+            (odt.request.format, odt.request.page_breaks),
+            (ExportFormat::Odt, true)
+        );
         assert_eq!(
             parse_export(&args(&["a.pdf", "b.md", "--quebrar-paginas"])).unwrap_err(),
-            "--quebrar-paginas só vale para .docx"
+            "--quebrar-paginas só vale para .docx e .odt"
         );
     }
 
@@ -185,9 +193,11 @@ mod tests {
         );
         let command = parse_export(&args(&["a.pdf", "b.docx", "--sem-imagens"])).unwrap();
         assert!(!command.request.images);
+        let odt = parse_export(&args(&["a.pdf", "b.odt", "--sem-imagens"])).unwrap();
+        assert!(!odt.request.images);
         assert_eq!(
             parse_export(&args(&["a.pdf", "b.csv", "--sem-imagens"])).unwrap_err(),
-            "--sem-imagens só vale para .md e .docx"
+            "--sem-imagens só vale para .md, .docx e .odt"
         );
     }
 
@@ -204,9 +214,14 @@ mod tests {
                 .request
                 .faithful
         );
+        let odg = parse_export(&args(&["a.pdf", "b.odg", "--fiel"])).unwrap();
+        assert_eq!(
+            (odg.request.format, odg.request.faithful),
+            (ExportFormat::Odg, true)
+        );
         assert_eq!(
             parse_export(&args(&["a.pdf", "b.docx", "--fiel"])).unwrap_err(),
-            "--fiel só vale para .pptx"
+            "--fiel só vale para .pptx e .odg"
         );
     }
 

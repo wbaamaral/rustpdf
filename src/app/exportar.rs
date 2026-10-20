@@ -5,7 +5,7 @@ use crate::app::erros::ToolError;
 use crate::app::portas::{ImageSource, LayoutSource, OcrEngine, Renderer, RulingSource};
 use crate::dominio::exportacao::estrutura::structure_with;
 use crate::dominio::exportacao::modelo::{Document, PageContent, PageImage, TableRef};
-use crate::dominio::exportacao::slides::{faithful_slide, slide, Slide};
+use crate::dominio::exportacao::slides::{faithful_slide, slide_with_rulings, Slide};
 use crate::dominio::geometria::LayoutRect;
 use crate::dominio::layout::Page;
 pub use crate::dominio::paginas::PageRange;
@@ -20,12 +20,16 @@ pub enum ExportFormat {
     Xlsx,
     Docx,
     Pptx,
+    Odt,
+    Odg,
 }
 
 impl ExportFormat {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Docx,
         Self::Pptx,
+        Self::Odt,
+        Self::Odg,
         Self::Xlsx,
         Self::Markdown,
         Self::Csv,
@@ -41,7 +45,7 @@ impl ExportFormat {
             .find(|format| extension.as_deref() == Some(format.extension()))
             .ok_or_else(|| {
                 format!(
-                    "Formato de exportação não suportado: {output} (disponíveis: .md, .csv, .xlsx, .docx, .pptx)"
+                    "Formato de exportação não suportado: {output} (disponíveis: .md, .csv, .xlsx, .docx, .pptx, .odt, .odg)"
                 )
             })
     }
@@ -53,6 +57,8 @@ impl ExportFormat {
             Self::Xlsx => "xlsx",
             Self::Docx => "docx",
             Self::Pptx => "pptx",
+            Self::Odt => "odt",
+            Self::Odg => "odg",
         }
     }
 
@@ -64,6 +70,8 @@ impl ExportFormat {
             Self::Xlsx => "Excel",
             Self::Docx => "Word",
             Self::Pptx => "PowerPoint",
+            Self::Odt => "ODT (Writer)",
+            Self::Odg => "ODG (Draw)",
         }
     }
 
@@ -277,7 +285,17 @@ pub fn extract_slides(
             faithful_slide((layout.width, layout.height), png)
         } else {
             let pictures = render_images(sources, pdf, page.get(), &layout)?;
-            slide(&layout, pictures)
+            let segments = match sources.rulings {
+                Some(rulings) => rulings
+                    .segments(pdf, page.get())?
+                    .into_iter()
+                    .map(|((x0, y0), (x1, y1))| {
+                        ((x0, layout.height - y0), (x1, layout.height - y1))
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            slide_with_rulings(&layout, pictures, segments)
         });
     }
     Ok(slides)
@@ -538,11 +556,13 @@ mod tests {
     #[test]
     fn formats_come_from_the_extension() {
         assert_eq!(ExportFormat::from_output("a.DOCX"), Ok(ExportFormat::Docx));
+        assert_eq!(ExportFormat::from_output("c.ODT"), Ok(ExportFormat::Odt));
+        assert_eq!(ExportFormat::from_output("d.odg"), Ok(ExportFormat::Odg));
         assert_eq!(
             ExportFormat::from_output("b.md").unwrap().label(),
             "Markdown"
         );
-        assert!(ExportFormat::from_output("c.odt").is_err());
+        assert!(ExportFormat::from_output("e.desconhecido").is_err());
         assert!(ExportFormat::Csv.tables_only() && !ExportFormat::Pptx.tables_only());
         let request = ExportRequest::new("x.csv".into(), ExportFormat::Csv);
         assert_eq!(

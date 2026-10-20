@@ -60,6 +60,9 @@ pub fn package(slides: &[Slide]) -> Package {
                     let relationship = package.relate(Some(&path), IMAGE, &format!("../{media}"));
                     shapes.push_str(&picture(id, *rect, &relationship));
                 }
+                Shape::Line { start, end } => {
+                    shapes.push_str(&connector(id, *start, *end));
+                }
             }
         }
         package.add_part(
@@ -184,6 +187,22 @@ fn picture(id: usize, rect: LayoutRect, relationship: &str) -> String {
     )
 }
 
+fn connector(id: usize, start: (f64, f64), end: (f64, f64)) -> String {
+    let x = start.0.min(end.0);
+    let y = start.1.min(end.1);
+    let cx = (end.0 - start.0).abs().max(0.1);
+    let cy = (end.1 - start.1).abs().max(0.1);
+    let flip_h = if start.0 > end.0 { " flipH=\"1\"" } else { "" };
+    let flip_v = if start.1 > end.1 { " flipV=\"1\"" } else { "" };
+    format!(
+        "<p:cxnSp><p:nvCxnSpPr><p:cNvPr id=\"{id}\" name=\"Linha {id}\"/><p:cNvCxnSpPr/><p:nvPr/></p:nvCxnSpPr><p:spPr><a:xfrm{flip_h}{flip_v}><a:off x=\"{}\" y=\"{}\"/><a:ext cx=\"{}\" cy=\"{}\"/></a:xfrm><a:prstGeom prst=\"line\"><a:avLst/></a:prstGeom><a:ln w=\"12700\"><a:solidFill><a:srgbClr val=\"000000\"/></a:solidFill></a:ln></p:spPr></p:cxnSp>",
+        emu(x),
+        emu(y),
+        emu(cx),
+        emu(cy)
+    )
+}
+
 /// Tema mínimo exigido pelo mestre dos slides.
 const THEME: &str = concat!(
     "<a:theme xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" name=\"RustPDF\"><a:themeElements>",
@@ -291,5 +310,26 @@ mod tests {
     #[test]
     fn render_produces_a_zip() {
         assert!(render(&slides()).unwrap().starts_with(b"PK\x03\x04"));
+    }
+
+    #[test]
+    fn pptx_with_line_shape() {
+        let slides = vec![Slide {
+            size: (595.0, 842.0),
+            shapes: vec![
+                Shape::Line {
+                    start: (10.0, 20.0),
+                    end: (100.0, 50.0),
+                },
+                Shape::Line {
+                    start: (100.0, 50.0),
+                    end: (10.0, 20.0),
+                },
+            ],
+        }];
+        let files = package(&slides).into_files();
+        let slide = text(&files, "ppt/slides/slide1.xml");
+        assert!(slide.contains("<p:cxnSp>"));
+        assert!(render(&slides).unwrap().starts_with(b"PK\x03\x04"));
     }
 }

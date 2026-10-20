@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Verificação de todo envio: formatação, clippy, testes (com o teste de
 # arquitetura) e cobertura por camada com catraca (tools/cobertura.py).
-# O LibreOffice sem interface abre os .docx/.xlsx/.pptx exportados nos
+# O LibreOffice sem interface abre os .docx/.xlsx/.pptx/.odt/.odg exportados nos
 # testes de ponta a ponta (sem ele, esses testes só conferem o pacote).
 # Também é chamado pelo workflow Release antes de publicar pacotes.
 name: CI
@@ -29,13 +29,15 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
+          lfs: true
       - name: Dependências
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgtk-3-dev libqpdf-dev libturbojpeg0-dev zlib1g-dev \
             poppler-utils qpdf tesseract-ocr tesseract-ocr-eng unzip \
-            libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui
+            libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui \
+            libreoffice-draw-nogui
           rustup component add llvm-tools-preview rustfmt clippy
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Formatação

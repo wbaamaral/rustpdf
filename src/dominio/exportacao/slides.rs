@@ -23,6 +23,10 @@ pub enum Shape {
         rect: LayoutRect,
         png: Vec<u8>,
     },
+    Line {
+        start: (f64, f64),
+        end: (f64, f64),
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +38,15 @@ pub struct Slide {
 
 /// Slide editável: uma caixa de texto por bloco do layout e as imagens.
 pub fn slide(page: &Page, images: Vec<PageImage>) -> Slide {
+    slide_with_rulings(page, images, Vec::new())
+}
+
+/// Slide editável incluindo traços/linhas vetoriais (para formatos gráficos vetoriais como ODG).
+pub fn slide_with_rulings(
+    page: &Page,
+    images: Vec<PageImage>,
+    rulings: Vec<((f64, f64), (f64, f64))>,
+) -> Slide {
     let mut shapes: Vec<Shape> = page
         .blocks
         .iter()
@@ -60,6 +73,11 @@ pub fn slide(page: &Page, images: Vec<PageImage>) -> Slide {
         rect: image.rect,
         png: image.png,
     }));
+    shapes.extend(
+        rulings
+            .into_iter()
+            .map(|(start, end)| Shape::Line { start, end }),
+    );
     Slide {
         size: (page.width, page.height),
         shapes,
@@ -159,6 +177,24 @@ mod tests {
             [Shape::Picture {
                 rect: LayoutRect::new(0.0, 0.0, 300.0, 400.0),
                 png: vec![1, 2]
+            }]
+        );
+    }
+
+    #[test]
+    fn slide_with_rulings_keeps_vector_lines() {
+        let page = Page {
+            width: 300.0,
+            height: 400.0,
+            blocks: vec![],
+        };
+        let rulings = vec![((10.0, 20.0), (100.0, 20.0))];
+        let slide = slide_with_rulings(&page, Vec::new(), rulings);
+        assert_eq!(
+            slide.shapes,
+            [Shape::Line {
+                start: (10.0, 20.0),
+                end: (100.0, 20.0)
             }]
         );
     }

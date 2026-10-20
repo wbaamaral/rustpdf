@@ -724,6 +724,8 @@ unsafe fn build_menus(b: &mut Builder) -> *mut c_void {
         let label = match format {
             ExportFormat::Docx => "Documento como _Word…",
             ExportFormat::Pptx => "Documento como P_owerPoint…",
+            ExportFormat::Odt => "Documento como _ODT (Writer)…",
+            ExportFormat::Odg => "Documento como OD_G (Draw)…",
             ExportFormat::Xlsx => "Tabelas como _Excel…",
             ExportFormat::Markdown => "Documento como _Markdown…",
             ExportFormat::Csv => "Tabelas como _CSV…",
@@ -2272,7 +2274,6 @@ pub fn show_about() {
             .collect()
     };
     let authors = owned(&["Welyqrson Bastos Amaral".to_string()]);
-    let assisted = owned(&["Claude (Anthropic), via Claude Code".to_string()]);
     let components = owned(&component_versions());
     let libraries = owned(
         &LIBRARIES
@@ -2300,11 +2301,6 @@ pub fn show_about() {
         // Mostra o aviso da AGPL e o botão "Licença" com o link para o texto.
         gtk_about_dialog_set_license_type(about, LICENSE_AGPL_3_0_OR_LATER);
         gtk_about_dialog_set_authors(about, pointers(&authors).as_ptr());
-        gtk_about_dialog_add_credit_section(
-            about,
-            c"Desenvolvimento assistido por".as_ptr(),
-            pointers(&assisted).as_ptr(),
-        );
         gtk_about_dialog_add_credit_section(
             about,
             c"Bibliotecas".as_ptr(),

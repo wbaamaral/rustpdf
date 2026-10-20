@@ -1,120 +1,226 @@
 # RustPDF
 
-Editor de PDF para desktop, escrito em Rust, com interface GTK 3 e CLI: páginas, anotações, formulários AcroForm, edição do texto e das imagens já presentes na página, OCR e criptografia preservada ao salvar. Licença AGPL-3.0-or-later.
+> Editor de PDF nativo para desktop com interface GTK 3 e CLI, escrito em Rust.
+> Permite manipulação de páginas, anotações, formulários AcroForm, edição de texto e imagens, OCR pesquisável, criptografia preservada e exportação rica para suítes de escritório (Word, Excel, PowerPoint, LibreOffice Writer/Draw, Markdown e CSV).
 
-## Compilar e executar
+[![Licença: AGPL v3](https://img.shields.io/badge/Licen%C3%A7a-AGPL--3.0--or--later-blue.svg)](LICENSE)
+[![Linguagem: Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
+[![Interface: GTK 3](https://img.shields.io/badge/GUI-GTK%203-green.svg)](https://www.gtk.org/)
+[![Plataformas](https://img.shields.io/badge/Plataformas-Linux%20%7C%20Windows-lightgrey.svg)](#pacotes-linux-e-windows)
 
-Requer Rust, GTK 3, qpdf com `libqpdf`, Poppler (`pdfinfo`, `pdftoppm`, `pdftotext`), Tesseract, zlib e libjpeg-turbo instalados no sistema.
+---
 
+## 🚀 Recursos Principais
+
+### 📄 Gestão Completa de Páginas
+- Criar novos documentos em branco ou abrir PDFs existentes.
+- Inserir, duplicar, reordenar, girar, recortar e excluir páginas.
+- Mesclar e anexar páginas de múltiplos documentos.
+- Painel lateral com miniaturas e navegação rápida entre páginas.
+
+### ✍️ Edição Direta de Conteúdo
+- **Substituição de Texto**: clique duplo para alterar textos existentes (operadores `Tj`/`TJ`), inclusive dentro de Form XObjects compartilhados.
+- **Movimentação por Arraste**: selecione e reposicione blocos de texto ou imagens diretamente com o mouse.
+- **Gestão de Imagens**: inserir imagens PNG/JPEG por coordenadas, substituir, redimensionar, girar ou remover ocorrências individuais.
+- **Transformação de Objetos**: alças visuais para mover, rotacionar e redimensionar objetos com preservação geométrica.
+
+### 📝 Formulários (AcroForm) e Anotações
+- Criação e preenchimento de campos de texto (inclusive multilinha), caixas de seleção (*checkbox*), botões de rádio e listas/combos de escolha.
+- Inserção de notas adesivas e destaques de texto por coordenadas ou por seleção com o mouse.
+
+### 🔍 OCR Pesquisável Integrado
+- Reconhecimento de texto via Tesseract em páginas digitalizadas.
+- O modo **OCR Pesquisável** adiciona uma camada de texto invisível sobre o documento original, tornando-o indexável e selecionável sem alterar os pixels renderizados.
+
+### 📤 Exportação Estruturada Multiformato
+Exportação nativa a partir da interface gráfica ou via CLI:
+
+| Formato | Tipo | Características Principais |
+| --- | --- | --- |
+| **Word (`.docx`)** | Documento | Títulos estilizados, listas numeradas, tabelas estruturadas e paginação configurável (`--quebrar-paginas`). |
+| **Writer (`.odt`)** | Documento | Formato OpenDocument Text nativo para LibreOffice Writer. |
+| **PowerPoint (`.pptx`)** | Apresentação | Um slide por página com caixas de texto editáveis ou modo fiel (`--fiel`) com imagem da página. |
+| **Draw (`.odg`)** | Desenho Vetorial | **Vetorização nativa** para LibreOffice Draw com linhas, formas e caixas de texto editáveis. |
+| **Excel (`.xlsx`)** | Planilha | Extração inteligente de tabelas com uma aba por tabela e preservação de valores numéricos/monetários. |
+| **CSV (`.csv`)** | Dados | Exportação de tabelas tabulares com delimitador `;` e BOM UTF-8 compatível com planilhas. |
+| **Markdown (`.md`)** | Texto Estruturado | Cabeçalhos hierárquicos, parágrafos, listas, tabelas GFM e modo `--para-ia` otimizado para consumo por LLMs. |
+
+### 🔒 Segurança e Criptografia
+- Abertura de documentos protegidos por senha de usuário ou proprietário.
+- Preservação estrita das permissões e chaves criptográficas ao salvar (`qpdf --copy-encryption`).
+- Fornecimento seguro de senha pela entrada padrão (`--password-stdin`) na CLI, sem expor credenciais em listas de processos.
+
+---
+
+## 📦 Instalação e Execução
+
+### Pré-requisitos do Sistema
+- **Compilador**: Rust (edição 2021)
+- **Bibliotecas**: GTK 3 (`libgtk-3-dev`), qpdf (`libqpdf-dev`), zlib (`zlib1g-dev`), libjpeg-turbo (`libturbojpeg0-dev`)
+- **Ferramentas de Suporte**: Poppler (`pdfinfo`, `pdftoppm`, `pdftotext`), Tesseract OCR e descompactador `unzip`
+
+### Compilando a partir do Código-Fonte
 ```bash
+# Compilar versão otimizada
 cargo build --release --offline
-./target/release/rustpdf /caminho/documento.pdf
+
+# Executar a interface gráfica
+./target/release/rustpdf [arquivo.pdf]
 ```
 
-O argumento PDF é opcional. A interface tem barra de menus com mnemônicos e atalhos (Arquivo, Editar, Exibir, Documento, Comentários, Formulários, Ferramentas, Ajuda — **F1** lista os atalhos), duas barras planas com ícones simbólicos próprios e dicas, ferramentas exclusivas espelhadas no menu Ferramentas, navegação de páginas (primeira/anterior/página/seguinte/última), zoom real com ajuste à página/largura e Ctrl + roda do mouse, painel lateral com miniaturas das páginas e lista de comentários, e barra de status com página, formato do papel e zoom. Permite criar um documento, abrir e salvar como, navegar e ampliar páginas, girar, mover, excluir, recortar ou inserir páginas em branco, adicionar páginas de outro PDF, inserir notas, destacar áreas por coordenadas ou **arrastando o mouse sobre a página**, adicionar texto visível e imagens PNG/JPEG com posição definida em pontos PDF, **substituir texto já desenhado** (clique duplo) ou **movê-lo arrastando o mouse** (também `move-text` e `edit-text-at` na CLI) — só o trecho clicado muda, mesmo dentro de Form XObjects compartilhados, **substituir, mover ou remover imagens já presentes**, criar, listar e preencher campos de texto (inclusive multilinha), caixas de seleção, grupos de rádio e campos de escolha (combo ou lista) AcroForm, extrair páginas, exportar PNG, copiar texto extraído, **exportar o texto para Markdown** com títulos, parágrafos, listas e tabelas inferidos, para **Word** (títulos com estilo, listas numeradas do Word, tabelas com grade e tamanho da página; `--quebrar-paginas` mantém a paginação do PDF) ou **as tabelas para CSV ou Excel** para **PowerPoint** (um slide por página no tamanho dela, com caixas de texto editáveis e imagens nas posições do PDF, ou `--fiel`: a página como imagem) (`rustpdf-cli export ENTRADA.pdf SAIDA.{md,docx,pptx,csv,xlsx} [--paginas 1-3,7] [--para-ia] [--sem-imagens] [--quebrar-paginas] [--fiel] [--ocr IDIOMA] [--separador ;] [--sem-bom]`; `--para-ia` otimiza o Markdown para agentes de IA removendo cabeçalhos repetidos, paginação e ruídos, e unificando parágrafos entre páginas; `--ocr por` lê as páginas digitalizadas — sem texto — pelo Tesseract; Markdown e Word levam as imagens da página, a 150 dpi — no Markdown, em `<nome>_arquivos/`; CSV com uma tabela por arquivo, `;` e BOM UTF-8 por padrão para o Excel em português; XLSX com uma aba por tabela e números, valores em reais e porcentagens como números) e executar OCR da página. PDFs protegidos podem ser abertos com senha. O comando **OCR pesquisável** adiciona uma camada de texto invisível à página, preservando sua aparência. Desfazer/refazer preserva até 32 estados. As alterações ficam em uma cópia temporária até **Salvar como**.
+### Pacotes Prontos (Linux e Windows)
+O script `packaging/package.sh` gera instaladores e pacotes nativos:
+- **Linux**:
+  - Pacote portátil `.tar.gz` (com script `install.sh`)
+  - Arch Linux / Manjaro: `.pkg.tar.zst` (via `PKGBUILD`)
+  - Debian / Ubuntu: `.deb`
+  - Fedora / RHEL: `.rpm`
+- **Windows**:
+  - Pasta portátil `.zip` e instalador NSIS (`.exe`) via MSYS2 MINGW64.
 
-As coordenadas X e Y partem do canto inferior esquerdo da área visível. A aplicação considera recorte e rotação da página ao colocar texto, notas, destaques e campos.
+Veja detalhes completos em [packaging/README.md](packaging/README.md).
 
-## Licença
-
-Copyright (C) 2026 Welyqrson Bastos Amaral.
-
-O RustPDF é software livre: você pode redistribuí-lo e/ou modificá-lo sob os termos da **GNU Affero General Public License**, conforme publicada pela Free Software Foundation, versão 3 da Licença ou (a seu critério) qualquer versão posterior (`AGPL-3.0-or-later`). Ele é distribuído na esperança de ser útil, mas **sem nenhuma garantia**; veja o arquivo [LICENSE](LICENSE). Código-fonte: <https://github.com/wbaamaral/rustpdf>.
-
-Componentes de terceiros, licenças e a regra de integração com o Poppler estão em [TERCEIROS.md](TERCEIROS.md).
-
-## Pacotes (Linux e Windows)
-
-`packaging/package.sh linux` gera o `.tar.gz` portátil (com `install.sh`), o pacote Arch/Manjaro (`PKGBUILD` + `makepkg`), o `.rpm` e, onde houver `dpkg-deb`, o `.deb`. `packaging/package.sh windows`, no MSYS2 MINGW64, gera a pasta portátil `.zip` com GTK, Poppler, qpdf e Tesseract embutidos e o instalador NSIS. Detalhes, dependências e limitações em [packaging/README.md](packaging/README.md).
-
-## Diagnóstico de lentidão
-
-`RUSTPDF_TRACE=1 rustpdf documento.pdf` imprime no terminal quanto dura cada ação, render, processo externo (`pdftoppm`, `pdfinfo`, `qpdf`) e leitura/gravação do PDF. As miniaturas são geradas em segundo plano e só para as páginas alteradas.
-
-## Binários para teste
-
-Os executáveis compilados para Linux x86-64 estão em `dist/`. Na máquina de compilação, execute:
-
+### Binários Pré-compilados para Teste
+Executáveis compilados para Linux x86-64 acompanham o repositório em `dist/`:
 ```bash
-./dist/rustpdf-linux-x86_64 /caminho/documento.pdf
-./dist/rustpdf-cli-linux-x86_64 info /caminho/documento.pdf
+./dist/rustpdf-linux-x86_64 documento.pdf
+./dist/rustpdf-cli-linux-x86_64 info documento.pdf
 sha256sum -c dist/SHA256SUMS
 ```
 
-O binário da interface usa bibliotecas compartilhadas GTK 3, libqpdf, zlib e libjpeg-turbo. As funções de visualização, extração e OCR também chamam `pdfinfo`, `pdftoppm`, `pdftotext` e `tesseract` instalados no sistema. Esta compilação foi validada no ambiente local; outras distribuições podem precisar de versões compatíveis dessas bibliotecas.
+---
 
-Para uso sem interface gráfica:
+## 💻 Interface de Linha de Comando (`rustpdf-cli`)
 
+A CLI oferece controle total sobre todas as operações do editor:
+
+### Gestão de Documentos e Páginas
 ```bash
-./target/release/rustpdf-cli new vazio.pdf
-./target/release/rustpdf-cli append vazio.pdf duas-paginas.pdf vazio.pdf
-./target/release/rustpdf-cli note duas-paginas.pdf anotado.pdf 2 "Revisar esta página"
-./target/release/rustpdf-cli note-at anotado.pdf nota-local.pdf 1 "Revisar aqui" 120 320
-./target/release/rustpdf-cli highlight-at anotado.pdf destacado.pdf 1 120 320 200 20
-./target/release/rustpdf-cli insert-text anotado.pdf texto.pdf 1 "Texto adicionado"
-./target/release/rustpdf-cli insert-text-at texto.pdf texto-local.pdf 1 "Outra posição" 120 500 16
-./target/release/rustpdf-cli crop texto.pdf recortado.pdf 1 36
-./target/release/rustpdf-cli insert-image recortado.pdf com-imagem.pdf 1 foto.jpg
-./target/release/rustpdf-cli insert-image-at recortado.pdf imagem-local.pdf 1 foto.jpg 100 300 200 150
-./target/release/rustpdf-cli ocr-searchable digitalizado.pdf pesquisavel.pdf 1 por+eng
-./target/release/rustpdf-cli text-field pesquisavel.pdf formulario.pdf 1 cliente "Ana Maria" 72 700 220 30
-./target/release/rustpdf-cli set-field formulario.pdf preenchido.pdf cliente Beatriz
-./target/release/rustpdf-cli checkbox preenchido.pdf com-caixa.pdf 1 aceite nao 72 650 24
-./target/release/rustpdf-cli set-checkbox com-caixa.pdf aceito.pdf aceite sim
-./target/release/rustpdf-cli radio aceito.pdf com-radio.pdf 1 cor Azul "Azul,Verde,Vermelho" 72 600 24 30
-./target/release/rustpdf-cli set-radio com-radio.pdf cor-escolhida.pdf cor Verde
-./target/release/rustpdf-cli choice cor-escolhida.pdf com-lista.pdf 1 estado Aberto "Aberto,Fechado,Pendente" 72 520 220 30 lista
-./target/release/rustpdf-cli set-choice com-lista.pdf final.pdf estado Pendente
-./target/release/rustpdf-cli text-field final.pdf com-multi.pdf 1 obs "Linha 1\nLinha 2" 72 450 220 50 multiline
-./target/release/rustpdf-cli fields final.pdf
-./target/release/rustpdf-cli text-runs final.pdf 1
-./target/release/rustpdf-cli replace-text final.pdf editado.pdf 1 "Linha 1" "Outra linha"
-./target/release/rustpdf-cli images editado.pdf 1
-./target/release/rustpdf-cli image-draws editado.pdf 1                          # NOME, ocorrência, caixa, ângulo
-./target/release/rustpdf-cli move-image editado.pdf movida.pdf 1 Im1 10 -5      # única ocorrência
-./target/release/rustpdf-cli move-image editado.pdf movida.pdf 1 Im1 10 -5 2    # só a 2ª (ou: todas)
-./target/release/rustpdf-cli replace-image movida.pdf trocada.pdf 1 Im1 nova.png todas
-./target/release/rustpdf-cli replace-image-at movida.pdf trocada.pdf 1 60 45 nova.png
-./target/release/rustpdf-cli remove-image-at trocada.pdf sem-imagem.pdf 1 60 225
-./target/release/rustpdf-cli remove-image movida.pdf sem-imagem.pdf 1 Im1
-./target/release/rustpdf-cli info anotado.pdf
+# Criar documento vazio e anexar páginas
+rustpdf-cli new vazio.pdf
+rustpdf-cli append vazio.pdf duas-paginas.pdf resultado.pdf
+
+# Recortar margem da página (em pontos)
+rustpdf-cli crop documento.pdf recortado.pdf 1 36
+
+# Informações estruturais do PDF
+rustpdf-cli info documento.pdf
 ```
 
-Execute `rustpdf-cli` sem argumentos para a lista completa de comandos.
-
-Operações de imagem agem em **ocorrências** (cada desenho `/Nome Do`), nunca no nome inteiro por engano: por nome, se a imagem é desenhada mais de uma vez na página, informe `N` ou `todas` (sem isso o comando recusa e diz quantas há); por ponto, vale a imagem sob X Y. Substituir cria um XObject novo (ex.: `Im1_c1`) só para os desenhos escolhidos — as outras ocorrências e páginas mantêm a original; remover tira o recurso apenas quando nada mais o usa.
-
-### Objetos na página: selecionar, mover, redimensionar e girar
-
-Os mesmos recursos das alças da interface, com o objeto identificado por um ponto (X Y em pontos visíveis da página). A ordem de busca é a da interface: anotação/campo, imagem e texto.
-
+### Anotações e Formulários
 ```bash
-./target/release/rustpdf-cli select doc.pdf 1 175 560                         # tipo, moldura, caixa, ângulo, capacidades
-./target/release/rustpdf-cli move-object doc.pdf movido.pdf 1 175 560 30 -20  # desloca DX DY
-./target/release/rustpdf-cli resize-object doc.pdf maior.pdf 1 175 560 2 1.5  # escala nos eixos do objeto, em torno do centro
-./target/release/rustpdf-cli rotate-object doc.pdf girado.pdf 1 175 560 30    # graus, anti-horário, em torno do centro
-./target/release/rustpdf-cli transform-object doc.pdf t.pdf 1 175 560 1 0 0 1 10 0  # matriz afim A B C D E F (espaço da página)
+# Inserir nota adesiva por página ou por coordenadas
+rustpdf-cli note doc.pdf anotado.pdf 2 "Revisar este capítulo"
+rustpdf-cli note-at doc.pdf nota-local.pdf 1 "Observação importante" 120 320
+
+# Destacar área da página (X Y Largura Altura)
+rustpdf-cli highlight-at doc.pdf destacado.pdf 1 120 320 200 20
+
+# Inserir e preencher campos AcroForm
+rustpdf-cli text-field doc.pdf form.pdf 1 cliente "Nome do Cliente" 72 700 220 30
+rustpdf-cli set-field form.pdf preenchido.pdf cliente "Novo Nome"
+rustpdf-cli checkbox form.pdf com-caixa.pdf 1 aceite nao 72 650 24
+rustpdf-cli set-checkbox com-caixa.pdf aceito.pdf aceite sim
+rustpdf-cli radio form.pdf com-radio.pdf 1 opcao A "A,B,C" 72 600 24 30
+rustpdf-cli choice form.pdf com-lista.pdf 1 estado Aberto "Aberto,Pendente,Fechado" 72 520 220 30 lista
 ```
 
-`select` imprime uma propriedade por linha (`chave<TAB>valor`): `tipo` (`imagem:Im1`, `texto`, `anotacao:nota#0`…), `rotulo`, `origem`, `eixo_u`, `eixo_v`, `caixa`, `largura`, `altura`, `angulo`, `redimensionavel`, `giravel` e `proporcional`. Cada comando de transformação imprime a nova `caixa`. Só a ocorrência apontada muda: Form XObjects compartilhados são copiados (copy-on-write). As capacidades valem também na CLI: nota só move; destaque e campo não giram; texto só escala proporcionalmente; cisalhamento e espelhamento são recusados.
-
-Para um PDF protegido, a interface pede a senha ao abrir. A CLI pode recebê-la pela entrada padrão, sem incluí-la nos argumentos do processo:
-
+### Edição de Conteúdo e Imagens
 ```bash
-read -rsp 'Senha: ' RUSTPDF_INPUT_PASSWORD
-printf '%s\n' "$RUSTPDF_INPUT_PASSWORD" | ./target/release/rustpdf-cli --password-stdin info protegido.pdf
-printf '%s\n' "$RUSTPDF_INPUT_PASSWORD" | ./target/release/rustpdf-cli --password-stdin --allow-unencrypted-output insert-text protegido.pdf copia-sem-senha.pdf 1 "Novo texto"
-unset RUSTPDF_INPUT_PASSWORD
+# Adicionar novo texto ou imagem
+rustpdf-cli insert-text-at doc.pdf texto.pdf 1 "Texto inserido" 120 500 16
+rustpdf-cli insert-image-at doc.pdf imagem.pdf 1 logo.png 100 300 200 150
+
+# Substituir texto já existente
+rustpdf-cli replace-text doc.pdf alterado.pdf 1 "Texto Antigo" "Texto Novo"
+
+# Mover, substituir ou remover imagens existentes por ocorrência
+rustpdf-cli move-image doc.pdf movido.pdf 1 Im1 10 -5
+rustpdf-cli replace-image doc.pdf trocado.pdf 1 Im1 nova.png todas
+rustpdf-cli remove-image doc.pdf limpo.pdf 1 Im1
 ```
 
-A cópia de trabalho é descriptografada em uma pasta temporária privada. Salvar e extrair páginas mantêm a criptografia do original — mesmas senhas de usuário e proprietário, permissões e algoritmo (`qpdf --copy-encryption`; a senha é passada por arquivo de argumentos privado, não pela linha de comando). Gerar uma cópia sem senha exige confirmação explícita na interface ou `--allow-unencrypted-output` na CLI, e um PDF criptografado existente nunca é substituído por uma cópia sem senha.
+### Transformação Geométrica de Objetos
+```bash
+# Consultar propriedades do objeto sob um ponto (X Y)
+rustpdf-cli select doc.pdf 1 175 560
 
-## Verificação
+# Mover, redimensionar e girar objetos
+rustpdf-cli move-object doc.pdf movido.pdf 1 175 560 30 -20
+rustpdf-cli resize-object doc.pdf ampliado.pdf 1 175 560 2.0 1.5
+rustpdf-cli rotate-object doc.pdf girado.pdf 1 175 560 30
+```
 
-`cargo test --offline` roda os testes de unidade (domínio, casos de uso e adaptadores), os testes de contrato (`tests/contrato_*.rs`: Poppler e Tesseract reais × dublês), o teste de arquitetura (`tests/arquitetura.rs`) e `tests/cli.rs`; `tools/cobertura.py` mede a cobertura por camada e confere os mínimos e a catraca (`cobertura.txt`). Os testes da biblioteca e `tests/cli.rs`, que executa o binário `rustpdf-cli` (selecionar, mover, redimensionar, girar, recusas por capacidade e `qpdf --check`). Os testes usam qpdf, Poppler e Tesseract em PDFs reais para verificar criação, inserção, movimentação, rotação, exclusão, recorte, anotação, destaque, texto visível, imagem, posicionamento, OCR pesquisável, campos de formulário, senhas, histórico, salvamento e renderização. Há também um teste de edição de conteúdo já existente: listagem e substituição de texto mostrado (inclusive dentro de Form XObjects), listagem/substituição/movimentação/remoção de imagens, `qpdf --check` e desfazer. O teste de destaque confirma a anotação `/Highlight` com `/QuadPoints`, mudança nos pixels renderizados e desfazer. O teste de OCR confirma que o texto se torna extraível e que os pixels renderizados permanecem idênticos. Os testes de formulário confirmam AcroForm, valores de texto atualizados, caixa marcada e desmarcada com aparências distintas, listagem e desfazer/refazer. A posição da nota é conferida na estrutura JSON de qpdf; a posição do texto é conferida por `pdftotext -bbox`, e imagens em posições diferentes produzem renderizações diferentes. Há ainda testes de coordenadas em páginas giradas e recortadas e de abertura com senha, incluindo bloqueio de salvamento sem consentimento explícito. `cargo clippy --offline --all-targets -- -D warnings` passa. Também foram executados fluxos pela CLI, seguidos de `qpdf --check`.
+### Exportação Multiformato
+```bash
+# Exportar documento para suítes de escritório
+rustpdf-cli export doc.pdf saida.docx                              # Microsoft Word
+rustpdf-cli export doc.pdf saida.odt                               # LibreOffice Writer
+rustpdf-cli export doc.pdf saida.pptx                              # PowerPoint (editável)
+rustpdf-cli export doc.pdf saida.pptx --fiel                       # PowerPoint (página como imagem)
+rustpdf-cli export doc.pdf saida.odg                               # LibreOffice Draw (vetorial)
 
-A interface GTK foi aberta na sessão gráfica `:0` e exercitada com um PDF de 3 páginas: menu, barras de ferramentas, navegação pela barra lateral (Página 1/2/3 com destaque da página atual), campo de página e barra de status. O fluxo de destaque com o mouse também foi exercitado: ativar **Destaque com mouse**, arrastar sobre a página, conferir a anotação renderizada e usar **Desfazer**. Os demais diálogos e o comportamento em outras resoluções ainda merecem prova manual.
+# Exportar dados tabulares
+rustpdf-cli export doc.pdf tabelas.xlsx                            # Planilha Excel
+rustpdf-cli export doc.pdf tabelas.csv --separador ';'             # Tabelas em CSV
 
-## Cobertura atual
+# Exportar para Markdown (geral e otimizado para IA)
+rustpdf-cli export doc.pdf documento.md                            # Markdown semântico
+rustpdf-cli export doc.pdf documento.md --para-ia                  # Otimizado para LLMs e agentes
 
-A aplicação ainda não reproduz edição tipográfica completa de caixas de texto existentes (reposicionar/estilizar glifos), assinaturas digitais, carimbos nem PDF/A. A edição de conteúdo cobre **substituição de texto mostrado** (operadores `Tj`/`TJ`) em conteúdo da página e em Form XObjects de overlay, **mover, redimensionar e girar** imagens e trechos de texto pela interface ou pela CLI (só a ocorrência selecionada) e **substituição/remoção de imagens** raster (XObject `/Image`), também por ocorrência. Texto convertido em curvas, strings em CID/fontes embutidas complexas e texto dividido em muitos `TJ` com kerning ainda não são editáveis. O OCR comum retorna texto em uma janela; o OCR pesquisável processa somente a página atual, exige os idiomas solicitados instalados no Tesseract e usa Helvetica com substituição por `?` para caracteres não representáveis em WinAnsi. Campos de formulário cobrem texto (inclusive multilinha), caixa de seleção, grupo de rádio e escolha combo/lista; todos são widgets AcroForm com nome e posição em pontos PDF. A listagem e o preenchimento programático atendem campos diretos na lista principal do AcroForm; campos hierárquicos ou com widget separado ainda não são atendidos. A aparência do texto usa Helvetica e pode substituir caracteres fora de WinAnsi por `?`. As notas e os destaques são anotações PDF reais, posicionadas por coordenadas. O destaque pode ser criado por coordenadas ou por arraste do mouse sobre a prévia; a seleção é retangular e ainda não acompanha glifos de texto. O texto visível usa Helvetica e aceita somente caracteres Latin-1 nesta versão. Imagens PNG/JPEG podem ser posicionadas e dimensionadas; a inserção simples ainda as centraliza em até 70% da página. PNGs precisam ter 8 bits por canal e não podem ser entrelaçados.
+# Opções de intervalo de páginas e OCR para documentos escaneados
+rustpdf-cli export doc.pdf parcial.docx --paginas 1-3,7
+rustpdf-cli export escaneado.pdf texto.md --ocr por
+```
+
+### Documentos Protegidos com Senha
+```bash
+# Ler e operar com senha via stdin com segurança
+printf '%s\n' "$SENHA" | rustpdf-cli --password-stdin info protegido.pdf
+printf '%s\n' "$SENHA" | rustpdf-cli --password-stdin insert-text protegido.pdf out.pdf 1 "Texto"
+```
+
+---
+
+## ⌨️ Atalhos Principais da Interface
+
+| Tecla | Ação |
+| --- | --- |
+| **Ctrl + O** | Abrir documento PDF |
+| **Ctrl + S** | Salvar cópia do documento |
+| **Ctrl + Z** / **Ctrl + Shift + Z** | Desfazer / Refazer (até 32 estados) |
+| **Ctrl + +** / **Ctrl + -** | Ampliar / Reduzir zoom |
+| **Ctrl + 0** | Ajustar largura à janela |
+| **Ctrl + 1** | Ajustar página inteira |
+| **Home** / **End** | Ir para a primeira / última página |
+| **Page Up** / **Page Down** | Ir para a página anterior / seguinte |
+| **F1** | Exibir lista completa de atalhos e ajuda |
+
+---
+
+## 🛠️ Diagnóstico de Desempenho
+
+`RUSTPDF_TRACE=1 rustpdf documento.pdf` imprime no terminal a duração exata de cada ação, renderização, chamadas externas (`pdftoppm`, `pdfinfo`, `qpdf`) e operações de E/S. As miniaturas são geradas em segundo plano e exclusivamente para páginas modificadas.
+
+---
+
+## 🔬 Qualidade e Engenharia de Software
+
+O desenvolvimento segue princípios de código limpo e testes contínuos:
+
+- **Arquitetura em Camadas**: separação estrita entre `dominio` (regras puras sem efeitos colaterais), `app` (casos de uso e portas), `infra` (adaptadores para processos e bibliotecas do sistema) e `apresentacao` (lógica desacoplada da GUI).
+- **Testes Automatizados**: testes de unidade puros, testes de contrato comparando dublês com ferramentas reais (Poppler, Tesseract, QPDF) e testes de integração de ponta a ponta na CLI.
+- **Catraca de Cobertura**: aferição contínua via `tools/cobertura.py` com metas mínimas por camada (`dominio` ≥ 90%, `app`/`apresentacao` ≥ 85%) e cobertura global monitorada.
+- **Integração Contínua**: workflows automatizados no GitHub Actions validando compilação, formatação, clippy e cobertura em Ubuntu, Arch Linux, Fedora e Windows.
+
+---
+
+## ⚖️ Licença
+
+Copyright (C) 2026 Welyqrson Bastos Amaral.
+
+Este programa é software livre: você pode redistribuí-lo e/ou modificá-lo sob os termos da **GNU Affero General Public License** (`AGPL-3.0-or-later`), conforme publicada pela Free Software Foundation, versão 3 da licença ou (a seu critério) qualquer versão posterior.
+
+O RustPDF é distribuído na expectativa de que seja útil, mas **SEM NENHUMA GARANTIA**; sem mesmo a garantia implícita de COMERCIABILIDADE ou ADEQUAÇÃO A UM DETERMINADO PROPÓSITO. Consulte o arquivo [LICENSE](LICENSE) para obter mais detalhes.
+
+Informações detalhadas sobre componentes de terceiros, bibliotecas de sistema utilizadas e declarações de licenças estão disponíveis em [TERCEIROS.md](TERCEIROS.md). Código-fonte público: <https://github.com/wbaamaral/rustpdf>.

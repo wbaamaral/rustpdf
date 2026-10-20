@@ -343,6 +343,16 @@ impl FileKind {
                 &["pptx"],
                 &["application/vnd.openxmlformats-officedocument.presentationml.presentation"],
             )],
+            FileKind::Export(ExportFormat::Odt) => &[(
+                "Documento OpenDocument Text (*.odt)",
+                &["odt"],
+                &["application/vnd.oasis.opendocument.text"],
+            )],
+            FileKind::Export(ExportFormat::Odg) => &[(
+                "Desenho OpenDocument Graphics (*.odg)",
+                &["odg"],
+                &["application/vnd.oasis.opendocument.graphics"],
+            )],
             FileKind::Export(ExportFormat::Xlsx) => &[(
                 "Planilha do Excel (*.xlsx)",
                 &["xlsx"],

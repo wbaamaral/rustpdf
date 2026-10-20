@@ -10,9 +10,11 @@ use crate::dominio::paginas::PageRange;
 pub const FIRST_ACTION: usize = 70;
 
 /// Itens do menu Exportar › Documento como…, na ordem.
-pub const MENU: [ExportFormat; 5] = [
+pub const MENU: [ExportFormat; 7] = [
     ExportFormat::Docx,
     ExportFormat::Pptx,
+    ExportFormat::Odt,
+    ExportFormat::Odg,
     ExportFormat::Xlsx,
     ExportFormat::Markdown,
     ExportFormat::Csv,
@@ -27,10 +29,11 @@ pub fn action_format(action: usize) -> Option<ExportFormat> {
 /// Pergunta sim/não da opção principal do formato, se houver.
 pub fn question(format: ExportFormat) -> Option<&'static str> {
     match format {
-        ExportFormat::Docx => Some("Manter as quebras de página do PDF?"),
+        ExportFormat::Docx | ExportFormat::Odt => Some("Manter as quebras de página do PDF?"),
         ExportFormat::Pptx => {
             Some("Exportar cada página como imagem (aparência fiel, sem texto editável)?")
         }
+        ExportFormat::Odg => None,
         ExportFormat::Markdown => Some("Incluir as imagens das páginas?"),
         ExportFormat::Csv | ExportFormat::Xlsx => None,
     }
@@ -55,8 +58,8 @@ pub fn request(
     let mut request = ExportRequest::new(output, format);
     request.pages = (!pages.is_empty()).then(|| pages.to_string());
     match format {
-        ExportFormat::Docx => request.page_breaks = answer,
-        ExportFormat::Pptx => request.faithful = answer,
+        ExportFormat::Docx | ExportFormat::Odt => request.page_breaks = answer,
+        ExportFormat::Pptx | ExportFormat::Odg => request.faithful = answer,
         ExportFormat::Markdown => request.images = answer,
         ExportFormat::Csv | ExportFormat::Xlsx => {}
     }
@@ -101,13 +104,15 @@ mod tests {
 
     #[test]
     fn menu_actions_map_to_formats() {
-        let formats: Vec<Option<ExportFormat>> = (69..=75).map(action_format).collect();
+        let formats: Vec<Option<ExportFormat>> = (69..=77).map(action_format).collect();
         assert_eq!(
             formats,
             [
                 None,
                 Some(ExportFormat::Docx),
                 Some(ExportFormat::Pptx),
+                Some(ExportFormat::Odt),
+                Some(ExportFormat::Odg),
                 Some(ExportFormat::Xlsx),
                 Some(ExportFormat::Markdown),
                 Some(ExportFormat::Csv),
@@ -123,7 +128,12 @@ mod tests {
             question(ExportFormat::Docx),
             Some("Manter as quebras de página do PDF?")
         );
+        assert_eq!(
+            question(ExportFormat::Odt),
+            Some("Manter as quebras de página do PDF?")
+        );
         assert!(question(ExportFormat::Pptx).unwrap().contains("imagem"));
+        assert_eq!(question(ExportFormat::Odg), None);
         assert_eq!(
             question(ExportFormat::Markdown),
             Some("Incluir as imagens das páginas?")
@@ -139,8 +149,12 @@ mod tests {
             (docx.pages.as_deref(), docx.page_breaks),
             (Some("1-2"), true)
         );
+        let odt = request("a.odt".into(), ExportFormat::Odt, " 1 ", false, 3).unwrap();
+        assert_eq!((odt.pages.as_deref(), odt.page_breaks), (Some("1"), false));
         let pptx = request("a.pptx".into(), ExportFormat::Pptx, "", true, 3).unwrap();
         assert_eq!((pptx.pages, pptx.faithful), (None, true));
+        let odg = request("a.odg".into(), ExportFormat::Odg, "", false, 3).unwrap();
+        assert_eq!((odg.pages, odg.faithful), (None, false));
         let markdown = request("a.md".into(), ExportFormat::Markdown, "", false, 3).unwrap();
         assert!(!markdown.images);
         assert_eq!(

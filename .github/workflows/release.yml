@@ -63,6 +63,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ env.REF }}
+          lfs: true
       - name: Dependências
         run: |
           sudo apt-get update
@@ -90,12 +91,13 @@ jobs:
     steps:
       - name: Dependências
         run: |
-          pacman -Syu --noconfirm --needed base-devel git rust gtk3 qpdf poppler \
+          pacman -Syu --noconfirm --needed base-devel git git-lfs rust gtk3 qpdf poppler \
             libjpeg-turbo zlib tesseract tesseract-data-eng namcap
           useradd -m builder
       - uses: actions/checkout@v5
         with:
           ref: ${{ env.REF }}
+          lfs: true
       - name: Pacote (makepkg não roda como root)
         run: |
           chown -R builder: "$GITHUB_WORKSPACE"
@@ -116,12 +118,13 @@ jobs:
     steps:
       - name: Dependências
         run: |
-          dnf install -y git rust cargo gcc gtk3-devel qpdf-devel turbojpeg-devel \
+          dnf install -y git git-lfs rust cargo gcc gtk3-devel qpdf-devel turbojpeg-devel \
             zlib-devel poppler-utils qpdf tesseract tesseract-langpack-eng \
             rpm-build desktop-file-utils file findutils which
       - uses: actions/checkout@v5
         with:
           ref: ${{ env.REF }}
+          lfs: true
       - name: Testes
         run: cargo test --release --offline
       - name: Pacote
@@ -143,10 +146,11 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ env.REF }}
+          lfs: true
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          update: true
+          update: false
           install: >-
             git zip
             mingw-w64-x86_64-rust
@@ -183,6 +187,7 @@ jobs:
         with:
           ref: ${{ env.REF }}
           fetch-depth: 0
+          lfs: true
       - uses: actions/download-artifact@v4
         with:
           path: artifacts

@@ -325,7 +325,7 @@ fn export_markdown_keeps_headings_paragraphs_and_lists() {
     ok(&["export", &input, &second, "--paginas", "2"]);
     assert_eq!(fs::read_to_string(&second).unwrap(), "Segunda pagina.\n");
 
-    let (success, _, stderr) = cli(&["export", &input, &path(root, "x.odt")]);
+    let (success, _, stderr) = cli(&["export", &input, &path(root, "x.desconhecido")]);
     assert!(!success && stderr.contains("não suportado"), "{stderr}");
     let (success, _, stderr) = cli(&["export", &input, &output, "--paginas", "9"]);
     assert!(
@@ -521,6 +521,129 @@ fn export_docx_opens_in_libreoffice() {
             .unwrap_or_else(|| panic!("{expected:?} fora de ordem em:\n{text}"));
         from += at + expected.len();
     }
+}
+
+#[test]
+fn export_odt_opens_in_libreoffice() {
+    let dir = workspace("export-odt");
+    let root = dir.path();
+    let input = path(root, "relatorio.pdf");
+    let mut pdf = PdfBuilder::new();
+    pdf.text_page(&[
+        (72.0, 760.0, 28.0, "Relatorio anual"),
+        (72.0, 700.0, 12.0, "O ano teve bons resultados."),
+        (72.0, 660.0, 12.0, "* Receita maior"),
+        (72.0, 620.0, 12.0, "Produto"),
+        (250.0, 620.0, 12.0, "Qtd"),
+        (72.0, 604.0, 12.0, "Caneta"),
+        (250.0, 604.0, 12.0, "10"),
+    ]);
+    pdf.write(Path::new(&input));
+    let output = path(root, "relatorio.odt");
+    ok(&["export", &input, &output, "--quebrar-paginas"]);
+    let bytes = fs::read(&output).unwrap();
+    assert!(bytes.starts_with(b"PK\x03\x04"));
+    assert_eq!(&bytes[30..38], b"mimetype");
+
+    let profile = format!(
+        "-env:UserInstallation=file://{}",
+        root.join("perfil").display()
+    );
+    let Ok(converted) = Command::new("soffice")
+        .args([
+            &profile,
+            "--headless",
+            "--convert-to",
+            "txt:Text (encoded):UTF8",
+            "--outdir",
+        ])
+        .arg(root)
+        .arg(&output)
+        .output()
+    else {
+        return; // sem LibreOffice neste sistema
+    };
+    assert!(
+        converted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&converted.stderr)
+    );
+    let text = fs::read_to_string(root.join("relatorio.txt")).unwrap();
+    for expected in [
+        "Relatorio anual",
+        "O ano teve bons resultados.",
+        "Receita maior",
+        "Produto",
+        "Qtd",
+        "Caneta",
+        "10",
+    ] {
+        assert!(
+            text.contains(expected),
+            "{expected:?} não encontrado em:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn export_odg_opens_in_libreoffice() {
+    let dir = workspace("export-odg");
+    let root = dir.path();
+    let input = path(root, "desenho.pdf");
+    let mut pdf = PdfBuilder::new();
+    pdf.text_page(&[
+        (72.0, 760.0, 28.0, "Primeira prancheta"),
+        (72.0, 700.0, 12.0, "Texto vetorial."),
+    ]);
+    pdf.text_page(&[(72.0, 760.0, 28.0, "Segunda prancheta")]);
+    pdf.write(Path::new(&input));
+
+    let editable = path(root, "editavel.odg");
+    ok(&["export", &input, &editable]);
+    let faithful = path(root, "fiel.odg");
+    ok(&["export", &input, &faithful, "--fiel"]);
+    let bytes = fs::read(&editable).unwrap();
+    assert!(bytes.starts_with(b"PK\x03\x04"));
+    assert_eq!(&bytes[30..38], b"mimetype");
+
+    let profile = format!(
+        "-env:UserInstallation=file://{}",
+        root.join("perfil").display()
+    );
+    let print = |file: &str| -> Option<PathBuf> {
+        let converted = Command::new("soffice")
+            .args([&profile, "--headless", "--convert-to", "pdf", "--outdir"])
+            .arg(root.join("impresso"))
+            .arg(file)
+            .output()
+            .ok()?;
+        assert!(converted.status.success());
+        let name = Path::new(file).with_extension("pdf");
+        Some(root.join("impresso").join(name.file_name().unwrap()))
+    };
+    let Some(printed) = print(&editable) else {
+        return; // sem LibreOffice neste sistema
+    };
+    let text = Command::new("pdftotext")
+        .arg(&printed)
+        .arg("-")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    for expected in ["Primeira prancheta", "Texto vetorial.", "Segunda prancheta"] {
+        assert!(text.contains(expected), "{expected:?} em:\n{text}");
+    }
+    let printed = print(&faithful).unwrap();
+    let list = Command::new("pdfimages")
+        .arg("-list")
+        .arg(&printed)
+        .output()
+        .unwrap();
+    let images = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .count()
+        .saturating_sub(2);
+    assert_eq!(images, 2, "uma imagem por prancheta");
 }
 
 #[test]

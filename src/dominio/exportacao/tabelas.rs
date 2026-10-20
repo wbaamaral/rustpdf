@@ -21,6 +21,11 @@ pub type WordId = (usize, usize, usize);
 const RULE_MERGE: f64 = 1.5;
 /// Comprimento mínimo de um traço da grade, em pontos.
 const RULE_MIN_LENGTH: f64 = 3.0;
+/// Altura máxima de uma linha de tabela com grade, em pontos.
+const MAX_GRID_ROW: f64 = 120.0;
+/// Mediana de palavras por célula acima da qual mesmo colunas descritivas
+/// são consideradas texto corrido.
+const MAX_DESC_CELL_WORDS: usize = 15;
 
 /// Espaço entre palavras, em alturas de linha, que separa células. Medidas
 /// reais: espaço comum ≈ 0,23; menor vão entre células numa tabela compacta
@@ -168,7 +173,7 @@ fn grid_tables(words: &[PlacedWord], segments: &[Segment]) -> Vec<FoundTable> {
             }
         }
     }
-    let mut components: Vec<(usize, Vec<f64>, Vec<f64>)> = Vec::new();
+    let mut components: Vec<(usize, Vec<Rule>, Vec<Rule>)> = Vec::new();
     for index in 0..total {
         let component = root(&mut parent, index);
         let entry = match components.iter().position(|(id, _, _)| *id == component) {
@@ -179,15 +184,81 @@ fn grid_tables(words: &[PlacedWord], segments: &[Segment]) -> Vec<FoundTable> {
             }
         };
         if index < horizontals.len() {
-            entry.1.push(horizontals[index].0);
+            entry.1.push(horizontals[index]);
         } else {
-            entry.2.push(verticals[index - horizontals.len()].0);
+            entry.2.push(verticals[index - horizontals.len()]);
         }
     }
     components
         .into_iter()
-        .filter_map(|(_, ys, xs)| grid_table(words, &cluster(ys), &cluster(xs)))
+        .flat_map(|(_, hs, vs)| component_grid_tables(words, &hs, &vs))
         .collect()
+}
+
+/// Extrai tabelas de grade de um componente conexo de traços horizontais e verticais.
+fn component_grid_tables(words: &[PlacedWord], hs: &[Rule], vs: &[Rule]) -> Vec<FoundTable> {
+    let ys = cluster(hs.iter().map(|h| h.0).collect());
+    if ys.len() < 3 {
+        return Vec::new();
+    }
+    // Faixas horizontais válidas: altura razoável e delimitadas por >= 3 traços verticais.
+    let mut valid_bands: Vec<(f64, f64, Vec<f64>)> = Vec::new();
+    for window in ys.windows(2) {
+        let (y0, y1) = (window[0], window[1]);
+        let height = y1 - y0;
+        if height <= 0.5 || height > MAX_GRID_ROW {
+            continue;
+        }
+        let covering_x: Vec<f64> = vs
+            .iter()
+            .filter(|&&(_x, vy0, vy1)| vy0 <= y0 + RULE_MERGE && vy1 >= y1 - RULE_MERGE)
+            .map(|v| v.0)
+            .collect();
+        let col_edges = cluster(covering_x);
+        if col_edges.len() >= 3 {
+            valid_bands.push((y0, y1, col_edges));
+        }
+    }
+    if valid_bands.is_empty() {
+        return Vec::new();
+    }
+
+    // Agrupa faixas contíguas que compartilham colunas compatíveis.
+    let mut runs: Vec<Vec<&(f64, f64, Vec<f64>)>> = Vec::new();
+    for band in &valid_bands {
+        let continues = runs
+            .last()
+            .and_then(|run: &Vec<&(f64, f64, Vec<f64>)>| run.last())
+            .is_some_and(|prev| {
+                (band.0 - prev.1).abs() <= RULE_MERGE && compatible_columns(&band.2, &prev.2)
+            });
+        if continues {
+            runs.last_mut().expect("run existe").push(band);
+        } else {
+            runs.push(vec![band]);
+        }
+    }
+
+    runs.into_iter()
+        .filter(|run| run.len() >= 2)
+        .filter_map(|run| {
+            let mut table_ys = vec![run[0].0];
+            for band in &run {
+                table_ys.push(band.1);
+            }
+            let table_xs = &run[0].2;
+            grid_table(words, &table_ys, table_xs)
+        })
+        .collect()
+}
+
+fn compatible_columns(xs1: &[f64], xs2: &[f64]) -> bool {
+    if xs1.len() != xs2.len() {
+        return false;
+    }
+    xs1.iter()
+        .zip(xs2)
+        .all(|(a, b)| (a - b).abs() <= RULE_MERGE)
 }
 
 /// Posições ordenadas, com as próximas (bordas duplas, retângulos finos)
@@ -406,13 +477,25 @@ fn table(run: &[&Row]) -> Option<FoundTable> {
     if !consistent || !clear {
         return None;
     }
-    // Uma coluna de células longas é texto corrido (mesmo que outra seja curta).
-    let prose = word_counts.iter_mut().any(|counts| {
+    // Uma coluna de células longas pode ser uma descrição de item em uma
+    // tabela de produtos/serviços; porém, em prosa corrida (duas ou mais
+    // colunas de texto de jornal/revista), a maioria das colunas é longa.
+    let mut long_cols = 0;
+    let mut excessive_cols = 0;
+    for counts in &mut word_counts {
         counts.sort_unstable();
-        counts
-            .get(counts.len() / 2)
-            .is_some_and(|&median| median > MAX_WORDS_PER_CELL)
-    });
+        if let Some(&median) = counts.get(counts.len() / 2) {
+            if median > MAX_WORDS_PER_CELL {
+                long_cols += 1;
+            }
+            if median > MAX_DESC_CELL_WORDS {
+                excessive_cols += 1;
+            }
+        }
+    }
+    let prose = excessive_cols > 0
+        || (columns.len() == 2 && long_cols > 0)
+        || (columns.len() > 2 && long_cols > columns.len() / 2);
     if prose {
         return None;
     }
@@ -1008,5 +1091,69 @@ mod tests {
         assert_eq!(tables.len(), 2);
         assert_eq!(tables[0].rows[0], ["X", "Y"]);
         assert_eq!(tables[1].rows[0], ["Nome", "Idade"]);
+    }
+
+    #[test]
+    fn page_border_frame_does_not_create_full_page_grid_table() {
+        // Página com moldura externa (5..590 x 5..837) e uma pequena tabela no topo (5..40).
+        // Textos no corpo da página (y=200, y=600) NÃO devem ser engolidos pela grade.
+        let mut blocks = vec![
+            cell("Coluna1", 10.0, 10.0),
+            cell("Coluna2", 200.0, 10.0),
+            cell("Valor1", 10.0, 25.0),
+            cell("Valor2", 200.0, 25.0),
+        ];
+        blocks.push(cell("Parágrafo livre no meio da página", 50.0, 200.0));
+        blocks.push(cell("Outro parágrafo no rodapé da página", 50.0, 600.0));
+        let layout = page(blocks);
+
+        // Moldura da página inteira
+        let mut segments = vec![
+            ((5.0, 5.0), (590.0, 5.0)),
+            ((5.0, 837.0), (590.0, 837.0)),
+            ((5.0, 5.0), (5.0, 837.0)),
+            ((590.0, 5.0), (590.0, 837.0)),
+        ];
+        // Grade da tabela do topo
+        segments.extend(grid(&[5.0, 180.0, 590.0], &[5.0, 20.0, 40.0]));
+
+        let tables = find_tables_with_rulings(&layout, &segments);
+        // Deve encontrar apenas a tabela do topo, sem engolir os textos do corpo
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].rows.len(), 2);
+        assert_eq!(tables[0].rows[0], ["Coluna1", "Coluna2"]);
+        assert_eq!(tables[0].rows[1], ["Valor1", "Valor2"]);
+        // Nenhuma palavra dos parágrafos livres deve estar na tabela
+        assert_eq!(tables[0].words.len(), 4);
+    }
+
+    #[test]
+    fn projection_accepts_table_with_one_descriptive_text_column() {
+        // Tabela de 3 colunas: Código (curto), Descrição (longo), Preço (curto).
+        // Não deve ser rejeitada como prosa corrida.
+        let layout = page(vec![
+            column(50.0, &[("101", 100.0), ("102", 120.0), ("103", 140.0)]),
+            column(
+                120.0,
+                &[
+                    ("Manutenção preventiva e corretiva de equipamentos", 100.0),
+                    ("Instalação e configuração de rede de computadores", 120.0),
+                    ("Consultoria técnica especializada em software", 140.0),
+                ],
+            ),
+            column(
+                450.0,
+                &[("150,00", 100.0), ("300,00", 120.0), ("450,00", 140.0)],
+            ),
+        ]);
+        let tables = find_tables(&layout);
+        assert_eq!(
+            tables.len(),
+            1,
+            "tabela com coluna de descrição deve ser detectada"
+        );
+        assert_eq!(tables[0].rows.len(), 3);
+        assert_eq!(tables[0].rows[0][0], "101");
+        assert_eq!(tables[0].rows[0][2], "150,00");
     }
 }

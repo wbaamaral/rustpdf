@@ -36,15 +36,31 @@ impl ZipWriter {
     /// Acrescenta `name` (caminho com `/`) com o conteúdo `data`: deflate
     /// quando reduz o tamanho, senão armazenado.
     pub fn add(&mut self, name: &str, data: &[u8]) -> Result<(), String> {
-        if self.entries.iter().any(|entry| entry.name == name) {
-            return Err(format!("ZIP: entrada repetida {name}"));
-        }
         let deflated = zlib::deflate_raw(data)?;
         let (method, stored) = if deflated.len() < data.len() {
             (8, deflated)
         } else {
             (0, data.to_vec())
         };
+        self.put_entry(name, method, data, &stored)
+    }
+
+    /// Acrescenta `name` sem compressão (método 0, armazenado), obrigatório
+    /// para certas partes como o `mimetype` do OpenDocument (ODF).
+    pub fn add_stored(&mut self, name: &str, data: &[u8]) -> Result<(), String> {
+        self.put_entry(name, 0, data, data)
+    }
+
+    fn put_entry(
+        &mut self,
+        name: &str,
+        method: u16,
+        data: &[u8],
+        stored: &[u8],
+    ) -> Result<(), String> {
+        if self.entries.iter().any(|entry| entry.name == name) {
+            return Err(format!("ZIP: entrada repetida {name}"));
+        }
         let too_big = |value: usize| u32::try_from(value).map_err(|_| "ZIP: arquivo grande demais");
         let entry = Entry {
             name: name.into(),
@@ -60,7 +76,7 @@ impl ZipWriter {
         self.put_common(&entry, name_len);
         put16(&mut self.bytes, 0); // campo extra
         self.bytes.extend_from_slice(name.as_bytes());
-        self.bytes.extend_from_slice(&stored);
+        self.bytes.extend_from_slice(stored);
         self.entries.push(entry);
         Ok(())
     }
@@ -206,6 +222,20 @@ mod tests {
         let mut zip = ZipWriter::new();
         zip.add("a.xml", b"1").unwrap();
         assert!(zip.add("a.xml", b"2").is_err());
+    }
+
+    #[test]
+    fn add_stored_forces_uncompressed_method_zero() {
+        let mut zip = ZipWriter::new();
+        let payload = "<Types/>".repeat(50).into_bytes();
+        zip.add_stored("mimetype", &payload).unwrap();
+        let bytes = zip.finish().unwrap();
+        let entries = read(&bytes);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "mimetype");
+        assert_eq!(entries[0].method, 0, "deve ser armazenado sem compressão");
+        assert_eq!(entries[0].size, payload.len());
+        assert_eq!(entries[0].stored, payload);
     }
 
     #[test]
