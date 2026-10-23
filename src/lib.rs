@@ -2692,8 +2692,12 @@ mod tests {
         drop(session);
     }
 
-    /// Erros de sintaxe que o poppler encontra ao desenhar a página
-    /// (operadores inválidos em aparências e overlays somem em silêncio).
+    /// Erros de sintaxe que o poppler encontra no conteúdo ao desenhar a
+    /// página (operadores inválidos em aparências e overlays somem em
+    /// silêncio). Só contam os que trazem a posição no fluxo —
+    /// `Syntax Error (6050): Unknown operator 'arc'`; avisos do ambiente,
+    /// como fontes do sistema ausentes no Windows (`No display font for
+    /// 'Symbol'`), não dizem nada do PDF gerado.
     fn poppler_syntax_errors(pdf: &Path) -> Vec<String> {
         let output = crate::infra::ferramentas::tool_command("pdftoppm")
             .args(["-r", "20", "-png"])
@@ -2703,7 +2707,7 @@ mod tests {
             .expect("pdftoppm");
         String::from_utf8_lossy(&output.stderr)
             .lines()
-            .filter(|line| line.contains("Error"))
+            .filter(|line| is_content_error(line))
             .map(str::to_string)
             .collect()
     }
@@ -2945,6 +2949,28 @@ mod tests {
         assert!(!session.extract_text().unwrap().contains("Pix"));
         assert!(session.list_form_fields().unwrap().is_empty());
         assert!(!session.can_undo());
+    }
+
+    fn is_content_error(line: &str) -> bool {
+        ["Syntax Error (", "Syntax Warning ("]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+    }
+
+    #[test]
+    fn only_positioned_poppler_errors_count_as_content_errors() {
+        assert!(is_content_error(
+            "Syntax Error (6050): Unknown operator 'arc'"
+        ));
+        assert!(is_content_error(
+            "Syntax Warning (12): Too few (2) args to 'm'"
+        ));
+        assert!(!is_content_error(
+            "Syntax Error: No display font for 'Symbol'"
+        ));
+        assert!(!is_content_error(
+            "Config Error: No display font for 'ArialNarrow'"
+        ));
     }
 
     #[test]
