@@ -56,6 +56,8 @@ pub(crate) mod ffi {
         pub(crate) fn qpdf_oh_is_array(qpdf: *mut c_void, object: u32) -> c_int;
         pub(crate) fn qpdf_oh_is_dictionary(qpdf: *mut c_void, object: u32) -> c_int;
         pub(crate) fn qpdf_oh_is_name(qpdf: *mut c_void, object: u32) -> c_int;
+        pub(crate) fn qpdf_oh_is_null(qpdf: *mut c_void, object: u32) -> c_int;
+        pub(crate) fn qpdf_oh_is_number(qpdf: *mut c_void, object: u32) -> c_int;
         pub(crate) fn qpdf_oh_is_name_and_equals(
             qpdf: *mut c_void,
             object: u32,
@@ -177,6 +179,24 @@ impl Drop for Document {
             qpdf_cleanup(&mut pointer);
         }
     }
+}
+
+/// Chaves (com a barra) de um dicionário do qpdf.
+pub(crate) fn dict_keys(doc: &Document, dict: u32) -> Vec<String> {
+    let mut keys = Vec::new();
+    unsafe { ffi::qpdf_oh_begin_dict_key_iter(doc.0, dict) };
+    while unsafe { ffi::qpdf_oh_dict_more_keys(doc.0) } != 0 {
+        let key = unsafe { ffi::qpdf_oh_dict_next_key(doc.0) };
+        if key.is_null() {
+            break;
+        }
+        keys.push(
+            unsafe { CStr::from_ptr(key) }
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    keys
 }
 
 #[cfg(test)]

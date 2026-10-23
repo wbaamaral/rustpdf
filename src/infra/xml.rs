@@ -58,6 +58,7 @@ pub fn escape(text: &str) -> String {
             '\'' => out.push_str("&apos;"),
             '\t' | '\n' | '\r' => out.push(character),
             c if (c as u32) < 0x20 => {}
+            '\u{fffe}' | '\u{ffff}' => {}
             c => out.push(c),
         }
     }
@@ -89,6 +90,7 @@ mod tests {
         );
         // Controles proibidos no XML 1.0 somem; tab e quebras ficam.
         assert_eq!(escape("x\u{0}y\u{1b}z\t\n\r"), "xyz\t\n\r");
+        assert_eq!(escape("a\u{fffe}b\u{ffff}c\u{d7ff}"), "abc\u{d7ff}");
         assert_eq!(unescape(&escape("<&'\">ç")), "<&'\">ç");
     }
 }

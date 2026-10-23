@@ -513,6 +513,18 @@ toolbar button:checked { background-color: alpha(@theme_selected_bg_color, 0.55)
 .rustpdf-welcome { font-size: 120%; color: alpha(@theme_fg_color, 0.65); }
 .rustpdf-statusbar { padding: 2px 8px; border-top: 1px solid alpha(currentColor, 0.15); }
 .rustpdf-statusbar label { font-size: 92%; }
+.rustpdf-dialog-heading { font-size: 116%; font-weight: bold; }
+.rustpdf-dialog-text { color: alpha(currentColor, 0.78); }
+.rustpdf-dialog-hint { font-size: 90%; color: alpha(currentColor, 0.6); }
+.rustpdf-dialog .dialog-action-area { padding: 6px 18px 18px 18px; }
+.rustpdf-dialog .dialog-action-area button { min-width: 92px; padding: 5px 16px; border-radius: 6px; }
+.rustpdf-dialog entry { min-height: 34px; padding: 0 10px; border-radius: 6px; }
+.rustpdf-dialog button.destructive-action { background-image: none; background-color: #c01c28; border-color: #a51d2d; color: #ffffff; }
+.rustpdf-dialog button.destructive-action:hover { background-color: #d42734; }
+.rustpdf-dialog button.destructive-action:active { background-color: #a51d2d; }
+.rustpdf-text-area { border: 1px solid alpha(currentColor, 0.22); border-radius: 6px; }
+.rustpdf-text-area text, .rustpdf-reader text { background-color: @theme_base_color; }
+.rustpdf-reader { font-size: 104%; }
 ";
 
 /// Monta a janela inteira e devolve o estado inicial.
@@ -602,7 +614,7 @@ pub unsafe fn build() -> AppState {
         ptr::null_mut(),
         G_CONNECT_AFTER,
     );
-    gtk_container_add(scroll, event_box);
+    gtk_container_add(scroll, crate::edicao_inline::wrap(event_box));
     for (signal, handler) in [
         (c"button-press-event", on_button_press as *const c_void),
         (c"button-release-event", on_button_release as *const c_void),
@@ -1667,13 +1679,17 @@ unsafe extern "C" fn on_key_press(
         return 0;
     }
     match key {
-        KEY_DELETE | KEY_KP_DELETE if current_selection().is_some() => {
+        KEY_DELETE | KEY_KP_DELETE
+            if current_selection().is_some() || crate::selecao_multipla::active() =>
+        {
             if let Err(error) = dispatch(58) {
                 status(&error);
             }
             1
         }
         KEY_ESCAPE => {
+            crate::menu_contexto::clear_page_selection();
+            crate::selecao_multipla::cancel_marquee();
             clear_drag();
             set_selection(None);
             if current_tool() != ToolMode::None {
@@ -1735,7 +1751,7 @@ pub fn update_sensitivity() {
             session.is_some(),
             session.is_some_and(PdfSession::can_undo),
             session.is_some_and(PdfSession::can_redo),
-            app.selection.is_some(),
+            app.selection.is_some() || crate::selecao_multipla::active(),
             (
                 app.ui.doc_widgets.clone(),
                 app.ui.undo_widgets.clone(),
@@ -1768,6 +1784,10 @@ pub fn update_sensitivity() {
 /// Redesenha prévia, título, navegação, painel lateral e barra de status.
 pub fn render_all() -> AppResult<()> {
     let _trace = rustpdf::trace(|| " render".into());
+    // A página vai mudar (edição, zoom, navegação): o campo ficaria fora do
+    // lugar e o destaque de "Selecionar tudo" não valeria mais.
+    crate::edicao_inline::cancel();
+    crate::menu_contexto::clear_page_selection();
     let snapshot = STATE.with(|cell| -> AppResult<Option<_>> {
         let mut borrowed = cell.borrow_mut();
         let app = borrowed.as_mut().ok_or("Interface ausente")?;

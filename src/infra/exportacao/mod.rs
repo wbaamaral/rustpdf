@@ -146,17 +146,10 @@ fn try_export_odg_via_soffice(
 ) -> Result<bool, String> {
     use crate::infra::ferramentas::tool_command;
 
-    let work_dir = std::env::temp_dir().join(format!(
-        "rustpdf_odg_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    if std::fs::create_dir_all(&work_dir).is_err() {
+    // Privada: guarda as páginas do documento e o resultado.
+    let Ok(work_dir) = crate::infra::arquivos::private_temp_dir("odg") else {
         return Ok(false);
-    }
+    };
     struct Cleaner<'a>(&'a Path);
     impl Drop for Cleaner<'_> {
         fn drop(&mut self) {
@@ -190,8 +183,8 @@ fn try_export_odg_via_soffice(
     };
 
     let profile = format!(
-        "-env:UserInstallation=file://{}",
-        work_dir.join("perfil").display()
+        "-env:UserInstallation={}",
+        file_url(&work_dir.join("perfil"))
     );
     let soffice_status = tool_command("soffice")
         .arg(&profile)
@@ -223,10 +216,40 @@ fn try_export_odg_via_soffice(
     }
 }
 
+/// URL `file:///…` de um caminho absoluto, com `/` e escapes `%xx`
+/// (`C:\\Users\\Zé` → `file:///C:/Users/Z%C3%A9`).
+fn file_url(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let mut url = String::from("file://");
+    if !text.starts_with('/') {
+        url.push('/');
+    }
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~:".contains(&byte) {
+            url.push(char::from(byte));
+        } else {
+            url.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::exportar::{ExportFormat, ExportRequest};
+
+    #[test]
+    fn file_urls_are_absolute_and_escaped() {
+        assert_eq!(
+            file_url(Path::new("/tmp/rustpdf odg/perfil")),
+            "file:///tmp/rustpdf%20odg/perfil"
+        );
+        assert_eq!(
+            file_url(Path::new("C:\\Users\\Zé\\perfil")),
+            "file:///C:/Users/Z%C3%A9/perfil"
+        );
+    }
     use crate::testkit::{PdfBuilder, TempDir};
 
     #[test]

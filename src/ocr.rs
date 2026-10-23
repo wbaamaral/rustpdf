@@ -1,25 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use crate::dominio::fonte::FontCodec;
 use crate::dominio::layout::Page;
 use crate::{write_one_page_pdf, AppResult};
 use std::path::Path;
 
 pub(crate) fn pdf_text(text: &str) -> Vec<u8> {
     let mut bytes = Vec::new();
+    let mut buffer = [0; 4];
     for character in text.chars() {
-        let code = match character {
-            '€' => 0x80,
-            '‘' => 0x91,
-            '’' => 0x92,
-            '“' => 0x93,
-            '”' => 0x94,
-            '–' => 0x96,
-            '—' => 0x97,
-            '…' => 0x85,
-            _ if (character as u32) <= 0xff && !matches!(character as u32, 0x80..=0x9f) => {
-                character as u8
-            }
-            _ => b'?',
-        };
+        // A camada pesquisável usa Helvetica com /WinAnsiEncoding.
+        let code = FontCodec::WinAnsi
+            .encode(character.encode_utf8(&mut buffer))
+            .map_or(b'?', |encoded| encoded[0]);
         if matches!(code, b'(' | b')' | b'\\') {
             bytes.push(b'\\');
         }
@@ -65,4 +57,15 @@ pub fn write_searchable_overlay(
     }
     write_one_page_pdf(destination, page_width, page_height, &stream, true)?;
     Ok(words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdf_text_uses_the_whole_win_ansi_table() {
+        assert_eq!(pdf_text("• ™ Œ (x)"), b"\x95 \x99 \x8c \\(x\\)".to_vec());
+        assert_eq!(pdf_text("中"), b"?".to_vec());
+    }
 }

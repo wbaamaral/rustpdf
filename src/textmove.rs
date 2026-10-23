@@ -8,6 +8,7 @@
 //! [`TextRunPlacement`], com posição em pontos da página e os trechos de
 //! bytes necessários para reescrever o conteúdo.
 
+use crate::dominio::fonte::FontCodec;
 use crate::dominio::geometria::local_delta;
 pub use crate::dominio::geometria::{
     apply, conjugate, invert, multiply, translation, Frame, Matrix, Segment, IDENTITY,
@@ -30,6 +31,46 @@ enum Token {
     DictStart,
     DictEnd,
     Operator(String),
+}
+
+/// Nome PDF sem a barra, com os escapes `#xx` resolvidos (`/F#2D0` é `F-0`).
+fn decode_name(raw: &[u8]) -> String {
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        let escaped = raw
+            .get(index + 1..index + 3)
+            .filter(|_| raw[index] == b'#')
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 16).ok())
+            // `#00` é inválido (o nome não pode conter NUL): fica cru.
+            .filter(|byte| *byte != 0);
+        match escaped {
+            Some(byte) => {
+                bytes.push(byte);
+                index += 3;
+            }
+            None => {
+                bytes.push(raw[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Nome PDF (sem a barra) pronto para o conteúdo: escapa com `#xx` o que não
+/// pode aparecer cru (espaços, delimitadores, `#`, bytes fora do ASCII visível).
+pub fn encode_name(name: &str) -> String {
+    let mut out = String::new();
+    for byte in name.bytes() {
+        if (0x21..=0x7e).contains(&byte) && byte != b'#' && !is_delimiter(byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("#{byte:02X}"));
+        }
+    }
+    out
 }
 
 fn is_space(byte: u8) -> bool {
@@ -104,9 +145,7 @@ impl<'a> Lexer<'a> {
                 {
                     self.position += 1;
                 }
-                Token::Operand(Operand::Name(
-                    String::from_utf8_lossy(&data[name_start..self.position]).into_owned(),
-                ))
+                Token::Operand(Operand::Name(decode_name(&data[name_start..self.position])))
             }
             _ => {
                 while self.position < data.len()
@@ -350,7 +389,12 @@ pub enum ShowKind {
 pub struct TextRunPlacement {
     /// Índice do stream em que o operador está (ver [`Interpreter::streams`]).
     pub stream: usize,
+    /// Bytes mostrados, um `char` por byte (legíveis só em fontes Latin-1).
     pub text: String,
+    /// Texto decodificado pela codificação da fonte, quando conhecida.
+    pub decoded: Option<String>,
+    /// Recurso de fonte ativo (`Tf`), sem a barra.
+    pub font: String,
     /// Trecho completo do operador (operandos + operador).
     pub span: (usize, usize),
     /// Trecho do operando string/array que é mostrado.
@@ -370,6 +414,19 @@ pub struct TextRunPlacement {
 }
 
 impl TextRunPlacement {
+    /// Texto legível: o decodificado pela fonte ou, sem ele, os bytes.
+    pub fn readable(&self) -> &str {
+        self.decoded.as_deref().unwrap_or(&self.text)
+    }
+
+    /// Bytes mostrados pelo operador (concatenados, sem os ajustes do `TJ`).
+    pub fn shown_bytes(&self) -> Vec<u8> {
+        self.text
+            .chars()
+            .map(|character| character as u32 as u8)
+            .collect()
+    }
+
     /// Matriz de renderização do texto (espaço do texto → página).
     pub fn text_rendering_matrix(&self) -> Matrix {
         let font = [
@@ -386,7 +443,7 @@ impl TextRunPlacement {
     /// Caixa aproximada (x0, y0, x1, y1) em pontos da página.
     pub fn approximate_box(&self) -> [f64; 4] {
         let trm = self.text_rendering_matrix();
-        let characters = self.text.chars().count().max(1) as f64;
+        let characters = self.readable().chars().count().max(1) as f64;
         let advance = 0.5 * characters;
         let points = [(0.0, -0.25), (advance, -0.25), (0.0, 0.9), (advance, 0.9)];
         let mut bounds = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
@@ -465,6 +522,7 @@ pub struct Invocation {
 #[derive(Clone)]
 struct GraphicsState {
     ctm: Matrix,
+    font: String,
     font_size: f64,
     horizontal_scale: f64,
     leading: f64,
@@ -532,6 +590,7 @@ impl<F: FnMut(u32, &str) -> XObject> Interpreter<F> {
         self.invocations.push(invocation);
         let mut state = GraphicsState {
             ctm,
+            font: String::new(),
             font_size: 1.0,
             horizontal_scale: 1.0,
             leading: 0.0,
@@ -647,6 +706,9 @@ impl<F: FnMut(u32, &str) -> XObject> Interpreter<F> {
                     }
                 }
                 "Tf" => {
+                    if let Some(Operand::Name(font)) = operands.first() {
+                        state.font = font.clone();
+                    }
                     if let Some(size) = number(operands, 1) {
                         state.font_size = size;
                     }
@@ -717,6 +779,8 @@ impl<F: FnMut(u32, &str) -> XObject> Interpreter<F> {
                     self.runs.push(TextRunPlacement {
                         stream,
                         text,
+                        decoded: None,
+                        font: state.font.clone(),
                         span: (operation.start, operation.end),
                         string_span,
                         kind,
@@ -796,6 +860,22 @@ fn format_number(value: f64) -> String {
     }
 }
 
+/// Matriz com 10 casas: a inversa precisa desfazer a ida sem deixar resíduo.
+fn format_precise_matrix(matrix: &Matrix) -> String {
+    matrix
+        .iter()
+        .map(|value| {
+            let text = format!("{value:.10}");
+            let text = text.trim_end_matches('0').trim_end_matches('.');
+            match text {
+                "-0" | "" => "0".to_string(),
+                _ => text.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn format_matrix(matrix: &Matrix) -> String {
     matrix
         .iter()
@@ -849,7 +929,7 @@ pub fn transform_draw(
 pub fn rename_draw(content: &[u8], draw: &ImageDraw, new_name: &str) -> Vec<u8> {
     let (start, end) = draw.span;
     let mut out = content[..start].to_vec();
-    out.extend_from_slice(format!("/{new_name} Do").as_bytes());
+    out.extend_from_slice(format!("/{} Do", encode_name(new_name)).as_bytes());
     out.extend_from_slice(&content[end..]);
     out
 }
@@ -881,11 +961,11 @@ pub fn run_frame(run: &TextRunPlacement, width: f64) -> Frame {
 pub fn measure_run_width(run: &TextRunPlacement, words: &[(String, [f64; 4])]) -> f64 {
     let trm = run.text_rendering_matrix();
     let em = trm[0].hypot(trm[1]);
-    let estimate = 0.5 * run.text.chars().count().max(1) as f64 * em;
+    let estimate = 0.5 * run.readable().chars().count().max(1) as f64 * em;
     let Some(inverse) = invert(&trm) else {
         return estimate;
     };
-    let text = run.text.as_str();
+    let text = run.readable();
     let characters = text.chars().count() as f64;
     // Fonte CID/hexadecimal: os bytes do operador não são o texto legível, então
     // as palavras são aceitas só pela geometria (faixa da linha de base).
@@ -918,12 +998,12 @@ pub fn measure_run_width(run: &TextRunPlacement, words: &[(String, [f64; 4])]) -
 /// senão (fonte CID/hexadecimal) vazio, para o chamador usar o do poppler.
 pub fn readable_text(run: &TextRunPlacement, clicked_text: &str) -> String {
     let clicked = clicked_text.trim();
-    let printable = run
-        .text
+    let text = run.readable();
+    let printable = text
         .chars()
         .all(|character| !character.is_control() || character == ' ');
-    if printable && (clicked.is_empty() || run.text.contains(clicked)) {
-        run.text.clone()
+    if printable && (clicked.is_empty() || text.contains(clicked)) {
+        text.to_string()
     } else {
         String::new()
     }
@@ -947,7 +1027,7 @@ pub fn run_width_from_bounds(run: &TextRunPlacement, bounds_width: f64, bounds_h
     } else {
         (bounds_height - height * cos) / sin
     };
-    let estimate = 0.5 * run.text.chars().count().max(1) as f64 * trm[0].hypot(trm[1]);
+    let estimate = 0.5 * run.readable().chars().count().max(1) as f64 * trm[0].hypot(trm[1]);
     if width.is_finite() && width > 0.5 {
         width
     } else {
@@ -1001,68 +1081,101 @@ fn rewrite_run(
         let (start, end) = run
             .block
             .ok_or("Bloco de texto sem ET: não é possível movê-lo")?;
+        // Sem `q … Q`: o `Q` restauraria também `Tf`, `Tc`, cores… que o
+        // bloco define e o resto da página usa. A CTM volta pela inversa.
+        let inverse = invert(local).ok_or("Transformação sem inversa")?;
         out.extend_from_slice(&content[..start]);
-        out.extend_from_slice(translate.as_bytes());
-        out.push(b' ');
+        out.extend_from_slice(format!("{} cm ", format_matrix(local)).as_bytes());
         out.extend_from_slice(&content[start..end]);
-        out.extend_from_slice(b" Q");
+        out.extend_from_slice(format!(" {} cm", format_precise_matrix(&inverse)).as_bytes());
         out.extend_from_slice(&content[end..]);
         Ok((out, true))
     }
 }
 
-/// Texto pode ser reescrito: literal de um byte por glifo (não hexadecimal/CID).
-pub fn run_is_editable(content: &[u8], run: &TextRunPlacement) -> bool {
+/// O operando mostrado é uma string hexadecimal (`<…>` ou `[<…> …]`).
+fn shown_is_hex(content: &[u8], run: &TextRunPlacement) -> bool {
     let shown = &content[run.string_span.0..run.string_span.1];
-    let hex = match shown.first() {
+    match shown.first() {
         Some(b'<') => true,
         Some(b'[') => shown[1..]
             .iter()
             .find(|byte| !is_space(**byte))
             .is_some_and(|byte| *byte == b'<'),
         _ => false,
-    };
-    !hex && !run.text.is_empty()
+    }
 }
 
-/// Codifica texto como literal PDF de um byte por caractere (Latin-1).
-fn latin1_literal(text: &str) -> Result<Vec<u8>, String> {
+/// Texto pode ser reescrito: com a codificação da fonte conhecida, sempre; sem
+/// ela, só literal de um byte por glifo (Latin-1, não hexadecimal/CID).
+pub fn run_is_editable(content: &[u8], run: &TextRunPlacement, codec: Option<&FontCodec>) -> bool {
+    !run.text.is_empty() && (codec.is_some() || !shown_is_hex(content, run))
+}
+
+/// String PDF literal com os bytes dados.
+fn pdf_literal(bytes: &[u8]) -> Vec<u8> {
     let mut out = vec![b'('];
-    for character in text.chars() {
-        let code = character as u32;
-        if code > 255 {
-            return Err(format!(
-                "Caractere “{character}” fora do Latin-1 nesta versão"
-            ));
-        }
-        match code as u8 {
-            byte @ (b'(' | b')' | b'\\') => out.extend_from_slice(&[b'\\', byte]),
-            byte @ (0x20..=0x7e) => out.push(byte),
-            byte => out.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
+    for byte in bytes {
+        match byte {
+            b'(' | b')' | b'\\' => out.extend_from_slice(&[b'\\', *byte]),
+            0x20..=0x7e => out.push(*byte),
+            _ => out.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
         }
     }
     out.push(b')');
-    Ok(out)
+    out
 }
 
-/// Substitui o texto mostrado apenas por este operador.
+/// String PDF hexadecimal com os bytes dados.
+fn pdf_hex(bytes: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'<'];
+    for byte in bytes {
+        out.extend_from_slice(format!("{byte:02X}").as_bytes());
+    }
+    out.push(b'>');
+    out
+}
+
+/// Substitui o texto mostrado apenas por este operador, codificado pela fonte
+/// (`codec`; sem ela, Latin-1). Mantém a forma original: hexadecimal continua
+/// hexadecimal e literal continua literal.
 pub fn replace_run_text(
     content: &[u8],
     run: &TextRunPlacement,
     new_text: &str,
+    codec: Option<&FontCodec>,
 ) -> Result<Vec<u8>, String> {
-    if !run_is_editable(content, run) {
+    if !run_is_editable(content, run, codec) {
         return Err("Este texto usa codificação de fonte não suportada para edição".into());
     }
-    let literal = latin1_literal(new_text)?;
+    let bytes = match codec {
+        Some(codec @ FontCodec::ToUnicode(_)) => codec.encode(new_text).map_err(|character| {
+            format!(
+                "A fonte deste texto (/{}) não contém o caractere “{character}”: ela foi \
+                 embutida só com os caracteres usados no documento",
+                run.font
+            )
+        })?,
+        Some(codec @ FontCodec::WinAnsi) => codec
+            .encode(new_text)
+            .map_err(|character| format!("Caractere “{character}” fora da codificação WinAnsi"))?,
+        Some(FontCodec::Latin1) | None => FontCodec::Latin1
+            .encode(new_text)
+            .map_err(|character| format!("Caractere “{character}” fora do Latin-1 nesta versão"))?,
+    };
+    let string = if shown_is_hex(content, run) {
+        pdf_hex(&bytes)
+    } else {
+        pdf_literal(&bytes)
+    };
     let (start, end) = run.string_span;
     let mut out = content[..start].to_vec();
     if content[start] == b'[' {
         out.push(b'[');
-        out.extend_from_slice(&literal);
+        out.extend_from_slice(&string);
         out.push(b']');
     } else {
-        out.extend_from_slice(&literal);
+        out.extend_from_slice(&string);
     }
     out.extend_from_slice(&content[end..]);
     Ok(out)
@@ -1094,6 +1207,24 @@ fn shows_single_glyph(run: &TextRunPlacement) -> bool {
     run.text.chars().count() <= 2
 }
 
+/// Os glifos ficam na mesma linha de base, um depois do outro — uma palavra
+/// desenhada letra a letra, não uma coluna de números (`(10) Tj 0 -20 Td (20) Tj`).
+fn along_one_baseline(group: &[TextRunPlacement]) -> bool {
+    let trm = group[0].text_rendering_matrix();
+    let em = trm[0].hypot(trm[1]).max(1e-9);
+    let (dx, dy) = (trm[0] / em, trm[1] / em);
+    let mut previous = f64::MIN;
+    group.iter().all(|glyph| {
+        let origin = glyph.text_rendering_matrix();
+        let (ox, oy) = (origin[4] - trm[4], origin[5] - trm[5]);
+        let along = ox * dx + oy * dy;
+        let across = oy * dx - ox * dy;
+        let ok = across.abs() <= 0.3 * em && along >= previous - 0.05 * em;
+        previous = along;
+        ok
+    })
+}
+
 /// Agrupa os operadores em unidades de texto (ver [`TextUnit`]).
 pub fn text_units(runs: &[TextRunPlacement]) -> Vec<TextUnit> {
     let mut units = Vec::new();
@@ -1110,7 +1241,7 @@ pub fn text_units(runs: &[TextRunPlacement]) -> Vec<TextUnit> {
             }
         }
         let group = &runs[index..end];
-        if group.len() > 1 && group.iter().all(shows_single_glyph) {
+        if group.len() > 1 && group.iter().all(shows_single_glyph) && along_one_baseline(group) {
             let mut run = first.clone();
             run.isolatable = false;
             let trm = first.text_rendering_matrix();
@@ -1145,7 +1276,7 @@ pub fn text_units(runs: &[TextRunPlacement]) -> Vec<TextUnit> {
                 run,
                 block: true,
                 glyphs: group.len(),
-                text: group.iter().map(|glyph| glyph.text.as_str()).collect(),
+                text: group.iter().map(|glyph| glyph.readable()).collect(),
                 width: Some(width),
                 bounds,
             });
@@ -1155,7 +1286,7 @@ pub fn text_units(runs: &[TextRunPlacement]) -> Vec<TextUnit> {
                     run: run.clone(),
                     block: false,
                     glyphs: 1,
-                    text: run.text.clone(),
+                    text: run.readable().to_string(),
                     width: None,
                     bounds: run.approximate_box(),
                 });
@@ -1206,10 +1337,10 @@ pub fn nearest_run<'a>(
 ) -> Option<&'a TextRunPlacement> {
     let clicked = clicked_text.trim();
     runs.iter()
-        .filter(|run| !run.text.trim().is_empty())
+        .filter(|run| !run.readable().trim().is_empty())
         .map(|run| {
             let mut score = run.distance_to(x, y);
-            let text = run.text.trim();
+            let text = run.readable().trim();
             if !clicked.is_empty() && (text.contains(clicked) || clicked.contains(text)) {
                 score -= 6.0;
             }
@@ -1283,7 +1414,7 @@ mod tests {
         assert!(whole_block);
         assert_eq!(
             moved,
-            b"q 1 0 0 1 4 0 cm BT 10 10 Td (A) Tj (B) Tj ET Q".to_vec()
+            b"1 0 0 1 4 0 cm BT 10 10 Td (A) Tj (B) Tj ET 1 0 0 1 -4 0 cm".to_vec()
         );
     }
 
@@ -1381,19 +1512,111 @@ mod tests {
     }
 
     #[test]
+    fn decodes_and_encodes_name_escapes() {
+        let interpreter = interpret(b"BT /F#2D0 10 Tf (a) Tj ET");
+        assert_eq!(interpreter.runs[0].font, "F-0");
+        assert_eq!(encode_name("Im 1#(x)"), "Im#201#23#28x#29");
+        assert_eq!(encode_name("FormXob.c3fb"), "FormXob.c3fb");
+    }
+
+    #[test]
+    fn column_of_short_numbers_is_not_a_letter_by_letter_word() {
+        let content = b"BT /F1 10 Tf 50 100 Td (10) Tj 0 -20 Td (20) Tj 0 -20 Td (30) Tj ET";
+        let units = text_units(&interpret(content).runs);
+        assert_eq!(units.len(), 3);
+        assert!(units.iter().all(|unit| !unit.block));
+        let word = b"BT /F1 10 Tf 50 100 Td (O) Tj 6 0 Td (i) Tj ET";
+        let units = text_units(&interpret(word).runs);
+        assert_eq!((units.len(), units[0].block), (1, true));
+    }
+
+    #[test]
+    fn moving_a_block_keeps_its_text_state_for_what_follows() {
+        let content =
+            b"BT /F1 12 Tf 1 0 0 rg 20 150 Td (AAA) Tj (BBB) Tj ET BT 20 100 Td (CCC) Tj ET";
+        let interpreter = interpret(content);
+        let (moved, whole) = move_run(content, &interpreter.runs[0], 10.0, 0.0).unwrap();
+        assert!(whole);
+        let text = String::from_utf8(moved).unwrap();
+        assert!(!text.contains(" Q"), "{text}");
+        // A CTM volta ao que era: o bloco seguinte fica no lugar.
+        let after = interpret(text.as_bytes());
+        let ccc = after.runs.iter().find(|run| run.text == "CCC").unwrap();
+        assert_eq!(ccc.ctm, IDENTITY);
+        assert_eq!(ccc.font, "F1");
+    }
+
+    #[test]
+    fn null_escape_in_name_is_kept_raw() {
+        let interpreter = interpret(b"BT /F#00 10 Tf (a) Tj ET");
+        assert_eq!(interpreter.runs[0].font, "F#00");
+    }
+
+    #[test]
+    fn records_font_of_each_run() {
+        let content = b"BT /F1-0 10 Tf (a) Tj q /F2 9 Tf (b) Tj Q (c) Tj ET";
+        let interpreter = interpret(content);
+        let fonts: Vec<&str> = interpreter
+            .runs
+            .iter()
+            .map(|run| run.font.as_str())
+            .collect();
+        assert_eq!(fonts, ["F1-0", "F2", "F1-0"]);
+    }
+
+    #[test]
+    fn rewrites_hex_text_with_the_font_codes() {
+        use crate::dominio::fonte::{FontCodec, ToUnicode};
+        let map = ToUnicode::parse(b"2 beginbfchar <01> <004F> <02> <0069> endbfchar").unwrap();
+        let codec = FontCodec::ToUnicode(map);
+        let content = b"BT /F1 10 Tf 0 0 Td[<0102>-3<01>]TJ 0 -9 Td<02>Tj ET";
+        let interpreter = interpret(content);
+        let runs = &interpreter.runs;
+        assert!(!run_is_editable(content, &runs[0], None));
+        assert!(run_is_editable(content, &runs[0], Some(&codec)));
+        let replaced = replace_run_text(content, &runs[0], "iO", Some(&codec)).unwrap();
+        assert_eq!(
+            replaced,
+            b"BT /F1 10 Tf 0 0 Td[<0201>]TJ 0 -9 Td<02>Tj ET".to_vec()
+        );
+        let error = replace_run_text(content, &runs[1], "Oz", Some(&codec)).unwrap_err();
+        assert!(error.contains("“z”"), "{error}");
+        // Literal continua literal, codificado pela fonte.
+        let literal = b"BT (x) Tj ET";
+        let runs = &interpret(literal).runs;
+        let replaced = replace_run_text(literal, &runs[0], "Oi", Some(&codec)).unwrap();
+        assert_eq!(replaced, b"BT (\\001\\002) Tj ET".to_vec());
+    }
+
+    #[test]
+    fn decoded_text_drives_labels_and_matching() {
+        let content = b"BT /F1 10 Tf 0 0 Td <0102> Tj ET";
+        let mut interpreter = interpret(content);
+        assert_eq!(readable_text(&interpreter.runs[0], ""), "");
+        interpreter.runs[0].decoded = Some("Oi".into());
+        assert_eq!(readable_text(&interpreter.runs[0], "Oi"), "Oi");
+        let unit = nearest_unit(&interpreter.runs, 1.0, 1.0, "Oi").unwrap();
+        assert_eq!(unit.text, "Oi");
+        // Palavras do poppler casam com o texto decodificado, não com os bytes.
+        let words = vec![("Oi".to_string(), [0.0, -2.0, 11.0, 9.0])];
+        let width = measure_run_width(&interpreter.runs[0], &words);
+        assert!((width - 11.0).abs() < 0.5, "{width}");
+    }
+
+    #[test]
     fn replaces_only_the_selected_run() {
         let content = b"BT 0 0 Td (Total) Tj 0 -20 Td [(To) 10 (tal)] TJ 0 -20 Td <0102> Tj ET";
         let interpreter = interpret(content);
         let runs = &interpreter.runs;
-        let replaced = replace_run_text(content, &runs[1], "Soma (R$)").unwrap();
+        let replaced = replace_run_text(content, &runs[1], "Soma (R$)", None).unwrap();
         assert_eq!(
             replaced,
             b"BT 0 0 Td (Total) Tj 0 -20 Td [(Soma \\(R$\\))] TJ 0 -20 Td <0102> Tj ET".to_vec()
         );
-        assert!(!run_is_editable(content, &runs[2]));
-        assert!(replace_run_text(content, &runs[0], "\u{4e2d}").is_err());
+        assert!(!run_is_editable(content, &runs[2], None));
+        assert!(replace_run_text(content, &runs[0], "\u{4e2d}", None).is_err());
         assert_eq!(
-            replace_run_text(content, &runs[0], "é").unwrap()[..20],
+            replace_run_text(content, &runs[0], "é", None).unwrap()[..20],
             b"BT 0 0 Td (\\351) Tj "[..]
         );
     }

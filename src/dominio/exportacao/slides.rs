@@ -65,7 +65,8 @@ pub fn slide_with_rulings(
             Some(Shape::Text {
                 rect,
                 lines: block.lines.iter().map(|line| line.text()).collect(),
-                font_size: ((height * FONT_RATIO) * 2.0).round() / 2.0,
+                // O PPTX aceita de 1 a 4000 pt (`sz` de 100 a 400000).
+                font_size: (((height * FONT_RATIO) * 2.0).round() / 2.0).clamp(1.0, 4000.0),
             })
         })
         .collect();
@@ -116,6 +117,22 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn font_size_stays_within_the_pptx_range() {
+        let page = Page {
+            width: 595.0,
+            height: 842.0,
+            blocks: vec![Block {
+                lines: vec![line("minúsculo", 72.0, 60.0, 0.2)],
+            }],
+        };
+        let slide = slide(&page, Vec::new());
+        let Some(Shape::Text { font_size, .. }) = slide.shapes.first() else {
+            panic!("sem caixa de texto");
+        };
+        assert!(*font_size >= 1.0, "{font_size}");
     }
 
     #[test]

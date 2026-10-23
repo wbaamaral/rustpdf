@@ -5,7 +5,8 @@
     tools/cobertura.py              mede e confere (falha se abaixo)
     tools/cobertura.py --atualizar  mede, confere os mínimos e grava a catraca
 
-Mede com `cargo llvm-cov` (linhas), sem a ligação GTK (main.rs, shell.rs,
+Mede com `cargo llvm-cov` (linhas), sem a ligação GTK (main.rs, shell.rs, edicao_inline.rs,
+menu_contexto.rs, dialogos.rs, selecao_multipla.rs, preencher.rs,
 icons.rs), que não tem regras. Mínimos por camada: dominio 90%,
 app e apresentacao 85% (camadas ainda vazias são ignoradas). A catraca em
 `cobertura.txt` guarda a cobertura total: ela não pode cair.
@@ -20,7 +21,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RATCHET = ROOT / "cobertura.txt"
 REPORT = ROOT / "target" / "cobertura.json"
-IGNORE = r"src/(main|shell|icons)\.rs|/rustc-|/library/|/\.cargo/"
+IGNORE = r"src/(main|shell|icons|edicao_inline|menu_contexto|dialogos|selecao_multipla|preencher)\.rs|/rustc-|/library/|/\.cargo/"
 MINIMUMS = {"dominio": 90.0, "app": 85.0, "apresentacao": 85.0}
 TOLERANCE = 0.25  # variação entre ambientes (versões do qpdf/poppler)
 

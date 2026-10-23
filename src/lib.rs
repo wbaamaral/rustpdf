@@ -20,7 +20,7 @@ pub mod textmove;
 #[doc(hidden)]
 pub mod testkit;
 
-pub use annotations::AnnotationInfo;
+pub use annotations::{AnnotationInfo, FieldInfo, FieldKind};
 use app::portas::{LayoutSource, OcrEngine, Renderer};
 pub use content::{
     ImageEditOutcome, ImageInfo, ImagePlacement, ImageTarget, Occurrence, TextEditOutcome,
@@ -963,15 +963,46 @@ impl PdfSession {
             }
             rectangles.push((label.clone(), geometry.rect(*x, *y, *width, *height)));
         }
-        let next = self.work_dir.join("next.pdf");
-        let _ = fs::remove_file(&next);
-        if let Err(error) =
-            annotations::add_radio_group(&self.work, &next, self.page, name, &rectangles, selected)
-        {
+        let labels: Vec<TextLine> = options
+            .iter()
+            .map(|(label, x, y, width, height)| {
+                let (lx, ly, size) = dominio::formularios::label_beside(*x, *y, *width, *height);
+                (label.clone(), lx, ly, size)
+            })
+            .collect();
+        self.with_labels(&labels, |session| {
+            let next = session.work_dir.join("next.pdf");
             let _ = fs::remove_file(&next);
-            return Err(error);
-        }
-        self.commit_next()
+            if let Err(error) = annotations::add_radio_group(
+                &session.work,
+                &next,
+                session.page,
+                name,
+                &rectangles,
+                selected,
+            ) {
+                let _ = fs::remove_file(&next);
+                return Err(error);
+            }
+            session.commit_next()
+        })
+    }
+
+    /// Aplica `insert` (que cria um campo) e desenha `labels` ao lado, como
+    /// uma edição só: um Desfazer remove os dois. Rótulos que não cabem na
+    /// página desfazem o campo e devolvem o erro.
+    fn with_labels(
+        &mut self,
+        labels: &[TextLine],
+        insert: impl FnOnce(&mut Self) -> AppResult<()>,
+    ) -> AppResult<()> {
+        self.as_one_edit(|session| {
+            insert(session)?;
+            if labels.is_empty() {
+                return Ok(());
+            }
+            session.insert_text_lines(labels)
+        })
     }
 
     /// Afeta páginas além da atual (troca de páginas ou campo por nome).
@@ -979,6 +1010,35 @@ impl PdfSession {
         self.set_radio_value_inner(name, selection)?;
         self.mark_global_change();
         Ok(())
+    }
+
+    /// Marca a opção do rádio pelo estado do widget (ver [`FieldInfo::on_state`]).
+    pub fn set_radio_state(&mut self, name: &str, state: &str) -> AppResult<()> {
+        let next = self.work_dir.join("next.pdf");
+        let _ = fs::remove_file(&next);
+        if let Err(error) = annotations::set_radio_state(&self.work, &next, name, state) {
+            let _ = fs::remove_file(&next);
+            return Err(error);
+        }
+        self.commit_next()?;
+        self.mark_global_change();
+        Ok(())
+    }
+
+    /// Campos do formulário do documento (para escolher qual preencher).
+    pub fn form_fields(&self) -> AppResult<Vec<FieldInfo>> {
+        annotations::form_fields(&self.work)
+    }
+
+    /// Campo de formulário do widget sob o ponto visível, para preencher.
+    pub fn form_field_at(&self, point: (f64, f64)) -> AppResult<Option<FieldInfo>> {
+        match self.select_at(point)? {
+            Some(Selection {
+                target: SelectionTarget::Annotation { index, .. },
+                ..
+            }) => annotations::field_of_annotation(&self.work, self.page, index),
+            _ => Ok(None),
+        }
     }
 
     fn set_radio_value_inner(&mut self, name: &str, selection: &str) -> AppResult<()> {
@@ -1076,6 +1136,38 @@ impl PdfSession {
         y: f64,
         size: f64,
     ) -> AppResult<()> {
+        self.insert_labeled_checkbox(name, "", checked, x, y, size)
+    }
+
+    /// Caixa de seleção com `label` desenhado ao lado (vazio = sem rótulo).
+    pub fn insert_labeled_checkbox(
+        &mut self,
+        name: &str,
+        label: &str,
+        checked: bool,
+        x: f64,
+        y: f64,
+        size: f64,
+    ) -> AppResult<()> {
+        let labels: Vec<TextLine> = if label.trim().is_empty() {
+            Vec::new()
+        } else {
+            let (lx, ly, font) = dominio::formularios::label_beside(x, y, size, size);
+            vec![(label.trim().to_string(), lx, ly, font)]
+        };
+        self.with_labels(&labels, |session| {
+            session.insert_bare_checkbox(name, checked, x, y, size)
+        })
+    }
+
+    fn insert_bare_checkbox(
+        &mut self,
+        name: &str,
+        checked: bool,
+        x: f64,
+        y: f64,
+        size: f64,
+    ) -> AppResult<()> {
         let geometry = self.current_page_geometry()?;
         if [x, y, size].iter().any(|number| !number.is_finite())
             || x < 0.0
@@ -1149,6 +1241,18 @@ impl PdfSession {
         let layout = self.page_layout()?;
         let (_, page_height) = self.page_dimensions()?;
         Ok(text_hit_in_page(&layout, x, y, page_height))
+    }
+
+    /// Caixas `[x0, y0, x1, y1]` (pontos visíveis, origem embaixo) de todas as
+    /// linhas de texto da página atual, na ordem de leitura.
+    pub fn page_text_lines(&self) -> AppResult<Vec<[f64; 4]>> {
+        let layout = self.page_layout()?;
+        let (_, page_height) = self.page_dimensions()?;
+        Ok(layout
+            .lines()
+            .filter_map(|line| line.rect())
+            .map(|rect| rect.to_pdf(page_height).to_array())
+            .collect())
     }
 
     /// Layout (blocos, linhas, palavras) da página atual.
@@ -1326,6 +1430,147 @@ impl PdfSession {
             uniform: true,
             corner_ratio: true,
         }))
+    }
+
+    /// Todos os objetos selecionáveis da página atual — anotações, imagens e
+    /// trechos de texto —, com moldura em pontos visíveis e âncora no centro
+    /// (que localiza o mesmo objeto nas operações).
+    pub fn page_objects(&self) -> AppResult<Vec<Selection>> {
+        let to_user = self.visible_to_user()?;
+        let to_visible = textmove::invert(&to_user).ok_or("Geometria de página inválida")?;
+        let mut objects = Vec::new();
+        for annotation in self.list_annotations()? {
+            let frame = Frame::from_rect(annotation.rect).transformed(&to_visible);
+            let resizable = annotation.kind != "nota";
+            objects.push(Selection {
+                anchor: frame.center(),
+                target: SelectionTarget::Annotation {
+                    index: annotation.index,
+                    kind: annotation.kind,
+                },
+                frame,
+                resizable,
+                rotatable: false,
+                uniform: false,
+                corner_ratio: false,
+            });
+        }
+        for image in content::image_placements(&self.work, self.page)? {
+            let frame = image.frame.transformed(&to_visible);
+            objects.push(Selection {
+                anchor: frame.center(),
+                target: SelectionTarget::Image { name: image.name },
+                frame,
+                resizable: true,
+                rotatable: true,
+                uniform: false,
+                corner_ratio: true,
+            });
+        }
+        let layout = self.page_layout()?;
+        let words = self.layout_words_user(&layout)?;
+        for (frame, text) in content::page_text_frames(&self.work, self.page, &words)? {
+            let frame = frame.transformed(&to_visible);
+            let line = text.trim().to_string();
+            objects.push(Selection {
+                anchor: frame.center(),
+                target: SelectionTarget::Text {
+                    word: line
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
+                    line,
+                },
+                frame,
+                resizable: true,
+                rotatable: true,
+                uniform: true,
+                corner_ratio: true,
+            });
+        }
+        Ok(objects)
+    }
+
+    /// Aplica `edit` (que pode fazer várias edições) como uma edição só no
+    /// histórico: um Desfazer volta ao estado anterior a todas. Se falhar no
+    /// meio, desfaz o que já foi feito.
+    fn as_one_edit(&mut self, edit: impl FnOnce(&mut Self) -> AppResult<()>) -> AppResult<()> {
+        let start = self.revision;
+        let result = edit(self);
+        let made = self
+            .past
+            .iter()
+            .filter(|entry| entry.revision >= start)
+            .count();
+        if let Err(error) = result {
+            for _ in 0..made {
+                self.undo()?;
+            }
+            self.clear_future();
+            return Err(error);
+        }
+        // Mantém só o retrato de antes da primeira edição.
+        if let Some(first) = self.past.iter().position(|entry| entry.revision == start) {
+            for entry in self.past.drain(first + 1..) {
+                let _ = fs::remove_file(entry.path);
+            }
+        }
+        Ok(())
+    }
+
+    /// Transforma vários objetos com a mesma matriz (ex.: mover a seleção),
+    /// numa edição só.
+    pub fn transform_selections(
+        &mut self,
+        selections: &[Selection],
+        transform: &Matrix,
+    ) -> AppResult<()> {
+        for selection in selections {
+            selection.check_transform(transform)?;
+        }
+        // Primeiro os que estão mais à frente no sentido do movimento: um
+        // objeto movido não cai sobre a âncora de outro ainda por mover.
+        let (dx, dy) = (transform[4], transform[5]);
+        let mut ordered: Vec<&Selection> = selections.iter().collect();
+        ordered.sort_by(|a, b| {
+            let along = |s: &Selection| s.anchor.0 * dx + s.anchor.1 * dy;
+            along(b).total_cmp(&along(a))
+        });
+        self.as_one_edit(|session| {
+            let mut moved_blocks = false;
+            for selection in ordered {
+                // Trecho encadeado de um bloco já movido inteiro: já andou.
+                if moved_blocks && matches!(selection.target, SelectionTarget::Text { .. }) {
+                    let still_there = session.select_at(selection.anchor)?.is_some_and(|found| {
+                        matches!(found.target, SelectionTarget::Text { .. })
+                            && same_bounds(found.frame.bounds(), selection.frame.bounds())
+                    });
+                    if !still_there {
+                        continue;
+                    }
+                }
+                let outcome = session.transform_selection(selection, transform)?;
+                moved_blocks |= outcome.whole_block;
+            }
+            Ok(())
+        })
+    }
+
+    /// Apaga vários objetos numa edição só.
+    pub fn delete_selections(&mut self, selections: &[Selection]) -> AppResult<()> {
+        // Anotações do maior índice para o menor: apagar renumera as seguintes.
+        let mut ordered: Vec<&Selection> = selections.iter().collect();
+        ordered.sort_by_key(|selection| match selection.target {
+            SelectionTarget::Annotation { index, .. } => std::cmp::Reverse(index),
+            _ => std::cmp::Reverse(usize::MAX),
+        });
+        self.as_one_edit(|session| {
+            for selection in ordered {
+                session.delete_selection(selection)?;
+            }
+            Ok(())
+        })
     }
 
     /// Palavras do layout do poppler com caixas no espaço padrão da página.
@@ -1642,22 +1887,29 @@ impl PdfSession {
         y: f64,
         font_size: f64,
     ) -> AppResult<()> {
-        if text.trim().is_empty() {
-            return Err("O texto está vazio".into());
-        }
+        self.insert_text_lines(&[(text.to_string(), x, y, font_size)])
+    }
+
+    /// Insere várias linhas de texto visível numa edição só.
+    fn insert_text_lines(&mut self, lines: &[TextLine]) -> AppResult<()> {
         let (width, height) = self.current_page_size()?;
-        if [x, y, font_size].iter().any(|number| !number.is_finite())
-            || x < 0.0
-            || y < 0.0
-            || x >= width
-            || y >= height
-            || !(1.0..=200.0).contains(&font_size)
-        {
-            return Err("Posição ou tamanho do texto inválido".into());
+        for (text, x, y, font_size) in lines {
+            if text.trim().is_empty() {
+                return Err("O texto está vazio".into());
+            }
+            if [x, y, font_size].iter().any(|number| !number.is_finite())
+                || *x < 0.0
+                || *y < 0.0
+                || *x >= width
+                || *y >= height
+                || !(1.0..=200.0).contains(font_size)
+            {
+                return Err("Posição ou tamanho do texto inválido".into());
+            }
         }
         let overlay = self.work_dir.join("overlay.pdf");
         let next = self.work_dir.join("next.pdf");
-        write_text_overlay(&overlay, width, height, text, x, y, font_size)?;
+        write_text_overlay(&overlay, width, height, lines)?;
         let result = self.apply_qpdf(&[
             self.work.as_os_str().to_owned(),
             OsString::from("--overlay"),
@@ -2010,6 +2262,16 @@ impl PdfSession {
         } else {
             fs::copy(&self.work, &staged).map_err(|e| format!("Falha ao salvar: {e}"))?;
         }
+        // Substituir um arquivo mantém as permissões dele (um PDF privado não
+        // pode ficar legível por outros só por ter sido salvo).
+        if let Ok(metadata) = fs::metadata(destination) {
+            if let Err(error) = fs::set_permissions(&staged, metadata.permissions()) {
+                let _ = fs::remove_file(&staged);
+                return Err(format!(
+                    "Falha ao preservar as permissões do destino: {error}"
+                ));
+            }
+        }
         if let Err(error) = replace_file(&staged, destination) {
             let _ = fs::remove_file(&staged);
             return Err(format!("Falha ao substituir o destino: {error}"));
@@ -2032,30 +2294,37 @@ pub fn create_blank_pdf(destination: &Path) -> AppResult<()> {
     write_one_page_pdf(destination, 595.0, 842.0, &[], false)
 }
 
+/// Mesmas caixas `[x0, y0, x1, y1]`, com meio ponto de tolerância.
+fn same_bounds(a: [f64; 4], b: [f64; 4]) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 0.5)
+}
+
+/// Linha de texto a inserir: texto, posição da linha de base e corpo.
+type TextLine = (String, f64, f64, f64);
+
 fn write_text_overlay(
     destination: &Path,
     width: f64,
     height: f64,
-    text: &str,
-    x: f64,
-    y: f64,
-    font_size: f64,
+    lines: &[TextLine],
 ) -> AppResult<()> {
-    let mut escaped = Vec::new();
-    for character in text.chars() {
-        let code = character as u32;
-        if code == 0 || code > 255 || matches!(code, 0x80..=0x9f) {
-            return Err("Texto inserido aceita apenas caracteres Latin-1 nesta versão".into());
+    let mut stream = Vec::new();
+    for (text, x, y, font_size) in lines {
+        // A fonte inserida é Helvetica com /WinAnsiEncoding.
+        let encoded = dominio::fonte::FontCodec::WinAnsi
+            .encode(text)
+            .map_err(|character| format!("Caractere “{character}” fora da codificação WinAnsi"))?;
+        stream.extend_from_slice(
+            format!("BT /F1 {font_size:.2} Tf 1 0 0 1 {x:.2} {y:.2} Tm (").as_bytes(),
+        );
+        for byte in encoded {
+            if matches!(byte, b'(' | b')' | b'\\') {
+                stream.push(b'\\');
+            }
+            stream.push(byte);
         }
-        let byte = code as u8;
-        if matches!(byte, b'(' | b')' | b'\\') {
-            escaped.push(b'\\');
-        }
-        escaped.push(byte);
+        stream.extend_from_slice(b") Tj ET\n");
     }
-    let mut stream = format!("BT /F1 {font_size:.2} Tf 1 0 0 1 {x:.2} {y:.2} Tm (").into_bytes();
-    stream.extend_from_slice(&escaped);
-    stream.extend_from_slice(b") Tj ET\n");
     write_one_page_pdf(destination, width, height, &stream, true)
 }
 
@@ -2164,6 +2433,13 @@ mod tests {
             .unwrap();
         session.insert_visible_text("Texto de teste").unwrap();
         assert!(session.extract_text().unwrap().contains("Texto de teste"));
+        // Aspas tipográficas, travessão e euro existem na WinAnsi.
+        session
+            .insert_visible_text_at("“Preço” – 5 €", 72.0, 300.0, 18.0)
+            .unwrap();
+        let text = session.extract_text().unwrap();
+        assert!(text.contains("“Preço” – 5 €"), "{text:?}");
+        assert!(session.insert_visible_text("中").is_err());
         let json = run(
             "qpdf",
             &[
@@ -2416,6 +2692,335 @@ mod tests {
         drop(session);
     }
 
+    /// Erros de sintaxe que o poppler encontra ao desenhar a página
+    /// (operadores inválidos em aparências e overlays somem em silêncio).
+    fn poppler_syntax_errors(pdf: &Path) -> Vec<String> {
+        let output = crate::infra::ferramentas::tool_command("pdftoppm")
+            .args(["-r", "20", "-png"])
+            .arg(pdf)
+            .arg(pdf.with_extension("render"))
+            .output()
+            .expect("pdftoppm");
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter(|line| line.contains("Error"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn page_objects_list_text_images_and_annotations() {
+        let dir = crate::testkit::TempDir::new("page-objects");
+        let source = dir.join("blank.pdf");
+        create_blank_pdf(&source).unwrap();
+        let image = dir.join("pixel.png");
+        fs::write(
+            &image,
+            crate::infra::png::encode_rgb(1, 1, &[9, 9, 9]).unwrap(),
+        )
+        .unwrap();
+        let mut session = PdfSession::open(&source).unwrap();
+        session
+            .insert_visible_text_at("Primeira", 72.0, 700.0, 14.0)
+            .unwrap();
+        session
+            .insert_visible_text_at("Segunda", 72.0, 600.0, 14.0)
+            .unwrap();
+        session
+            .insert_image_at(&image, 300.0, 500.0, 40.0, 40.0)
+            .unwrap();
+        session.add_text_note_at("Nota", 400.0, 300.0).unwrap();
+        let objects = session.page_objects().unwrap();
+        let texts: Vec<_> = objects
+            .iter()
+            .filter_map(|object| match &object.target {
+                SelectionTarget::Text { line, .. } => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Primeira", "Segunda"]);
+        assert_eq!(
+            objects
+                .iter()
+                .filter(|object| matches!(object.target, SelectionTarget::Image { .. }))
+                .count(),
+            1
+        );
+        assert!(objects
+            .iter()
+            .any(|object| matches!(object.target, SelectionTarget::Annotation { .. })));
+        // A âncora fica dentro da moldura: localiza o mesmo objeto depois.
+        for object in &objects {
+            assert!(object.frame.contains(object.anchor, 0.5), "{object:?}");
+        }
+        let first = objects
+            .iter()
+            .find(|object| object.label().contains("Primeira"))
+            .unwrap();
+        let [x0, y0, x1, y1] = first.frame.bounds();
+        assert!(
+            x0 < 73.0 && x1 > 120.0 && y0 < 700.0 && y1 > 708.0,
+            "{:?}",
+            first.frame
+        );
+    }
+
+    #[test]
+    fn several_objects_move_and_delete_as_one_edit() {
+        let dir = crate::testkit::TempDir::new("multi-edit");
+        let source = dir.join("blank.pdf");
+        create_blank_pdf(&source).unwrap();
+        let mut session = PdfSession::open(&source).unwrap();
+        session
+            .insert_visible_text_at("Alfa", 72.0, 700.0, 14.0)
+            .unwrap();
+        session
+            .insert_visible_text_at("Beta", 72.0, 600.0, 14.0)
+            .unwrap();
+        session.add_text_note_at("N1", 300.0, 300.0).unwrap();
+        session.add_text_note_at("N2", 400.0, 300.0).unwrap();
+        let objects = session.page_objects().unwrap();
+        let texts: Vec<Selection> = objects
+            .iter()
+            .filter(|object| matches!(object.target, SelectionTarget::Text { .. }))
+            .cloned()
+            .collect();
+        let history = session.past.len();
+        session
+            .transform_selections(&texts, &textmove::translation(0.0, -50.0))
+            .unwrap();
+        assert_eq!(session.past.len(), history + 1, "uma edição só");
+        let alfa = session.text_at(80.0, 655.0).unwrap().expect("Alfa movido");
+        assert_eq!(alfa.line, "Alfa");
+        let beta = session.text_at(80.0, 555.0).unwrap().expect("Beta movido");
+        assert_eq!(beta.line, "Beta");
+        assert!(session.text_at(80.0, 705.0).unwrap().is_none());
+
+        // Duas notas: a segunda muda de índice quando a primeira sai.
+        let notes: Vec<Selection> = session
+            .page_objects()
+            .unwrap()
+            .into_iter()
+            .filter(|object| matches!(object.target, SelectionTarget::Annotation { .. }))
+            .collect();
+        assert_eq!(notes.len(), 2);
+        session.delete_selections(&notes).unwrap();
+        assert!(session.list_annotations().unwrap().is_empty());
+        session.undo().unwrap();
+        assert_eq!(session.list_annotations().unwrap().len(), 2);
+        session.undo().unwrap();
+        assert!(
+            session.text_at(80.0, 705.0).unwrap().is_some(),
+            "movimento desfeito de uma vez"
+        );
+    }
+
+    #[test]
+    fn chained_runs_of_one_block_are_moved_once() {
+        let dir = crate::testkit::TempDir::new("chained-multi");
+        let input = dir.join("chained.pdf");
+        let mut pdf = crate::testkit::PdfBuilder::new();
+        let font = pdf.helvetica();
+        pdf.page(
+            595.0,
+            842.0,
+            &format!("/Font << /F1 {font} >>"),
+            "BT /F1 20 Tf 100 500 Td (AAA) Tj (BBB) Tj ET",
+        );
+        pdf.write(&input);
+        let mut session = PdfSession::open(&input).unwrap();
+        let texts = session.page_objects().unwrap();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        session
+            .transform_selections(&texts, &textmove::translation(30.0, 0.0))
+            .unwrap();
+        // O bloco andou 30 pt, não 60.
+        let hit = session
+            .text_at(140.0, 505.0)
+            .unwrap()
+            .expect("texto movido");
+        assert!((hit.rect[0] - 130.0).abs() < 1.0, "{:?}", hit.rect);
+    }
+
+    #[test]
+    fn form_fields_are_read_at_the_clicked_point_and_filled() {
+        let dir = crate::testkit::TempDir::new("fill-fields");
+        let source = dir.join("blank.pdf");
+        create_blank_pdf(&source).unwrap();
+        let mut session = PdfSession::open(&source).unwrap();
+        session
+            .insert_text_field("nome", "Ana", 72.0, 760.0, 200.0, 28.0, false)
+            .unwrap();
+        session
+            .insert_checkbox("aceite", false, 72.0, 720.0, 18.0)
+            .unwrap();
+        let options = vec![
+            ("Pix".to_string(), 72.0, 680.0, 18.0, 18.0),
+            ("Boleto".to_string(), 72.0, 652.0, 18.0, 18.0),
+        ];
+        session
+            .insert_radio_group("pagamento", &options, Some(0))
+            .unwrap();
+        let states = ["SP".to_string(), "RJ".to_string()];
+        session
+            .insert_choice_field("uf", "SP", &states, 72.0, 600.0, 160.0, 26.0, true)
+            .unwrap();
+        session
+            .insert_choice_field("lista", "RJ", &states, 300.0, 560.0, 160.0, 60.0, false)
+            .unwrap();
+        let at = |session: &PdfSession, x: f64, y: f64| {
+            session
+                .form_field_at((x, y))
+                .unwrap()
+                .expect("campo sob o ponto")
+        };
+        let text = at(&session, 100.0, 774.0);
+        assert_eq!(
+            (text.name.as_str(), &text.kind, text.value.as_str()),
+            ("nome", &FieldKind::Text, "Ana")
+        );
+        let checkbox = at(&session, 81.0, 729.0);
+        assert_eq!(checkbox.kind, FieldKind::Checkbox);
+        assert_eq!(checkbox.on_state.as_deref(), Some("Yes"));
+        let boleto = at(&session, 81.0, 661.0);
+        assert_eq!(
+            (boleto.name.as_str(), &boleto.kind),
+            ("pagamento", &FieldKind::Radio)
+        );
+        assert_eq!(boleto.value, "OptPix");
+        assert_eq!(boleto.on_state.as_deref(), Some("OptBoleto"));
+        let combo = at(&session, 100.0, 613.0);
+        assert_eq!(combo.kind, FieldKind::Combo);
+        assert_eq!(combo.options, ["SP", "RJ"]);
+        assert_eq!(at(&session, 350.0, 590.0).kind, FieldKind::List);
+        assert!(session.form_field_at((500.0, 300.0)).unwrap().is_none());
+
+        // Lista de todos os campos: rótulos do rádio com acento, estados na ordem.
+        let all = session.form_fields().unwrap();
+        let names: Vec<&str> = all.iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(names, ["nome", "aceite", "pagamento", "uf", "lista"]);
+        let radio = all.iter().find(|field| field.name == "pagamento").unwrap();
+        assert_eq!(radio.options, ["Pix", "Boleto"]);
+        assert_eq!(radio.states, ["OptPix", "OptBoleto"]);
+        let checkbox = all.iter().find(|field| field.name == "aceite").unwrap();
+        assert_eq!(checkbox.states, ["Yes"]);
+
+        session
+            .set_radio_state("pagamento", boleto.on_state.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(at(&session, 81.0, 689.0).value, "OptBoleto");
+        session.set_choice_value("uf", "RJ").unwrap();
+        assert_eq!(at(&session, 100.0, 613.0).value, "RJ");
+    }
+
+    #[test]
+    fn radio_and_checkbox_labels_are_visible_and_undo_in_one_step() {
+        let dir = crate::testkit::TempDir::new("form-labels");
+        let source = dir.join("blank.pdf");
+        create_blank_pdf(&source).unwrap();
+        let mut session = PdfSession::open(&source).unwrap();
+        let options = vec![
+            ("Pix".to_string(), 72.0, 700.0, 18.0, 18.0),
+            ("Cartão".to_string(), 72.0, 672.0, 18.0, 18.0),
+        ];
+        session
+            .insert_radio_group("pagamento", &options, None)
+            .unwrap();
+        let text = session.extract_text().unwrap();
+        assert!(text.contains("Pix") && text.contains("Cartão"), "{text:?}");
+        let radio = session.form_fields().unwrap().remove(0);
+        assert_eq!(radio.options, ["Pix", "Cartão"], "rótulos com acento");
+        session
+            .insert_labeled_checkbox("aceite", "Aceito os termos", false, 72.0, 620.0, 18.0)
+            .unwrap();
+        assert!(session.extract_text().unwrap().contains("Aceito os termos"));
+        // Campo e rótulo são uma edição só.
+        session.undo().unwrap();
+        let text = session.extract_text().unwrap();
+        assert!(!text.contains("Aceito"), "{text:?}");
+        let fields = session.list_form_fields().unwrap();
+        assert!(!fields.iter().any(|(name, ..)| name == "aceite"));
+        assert!(fields.iter().any(|(name, ..)| name == "pagamento"));
+        session.undo().unwrap();
+        assert!(!session.extract_text().unwrap().contains("Pix"));
+        assert!(session.list_form_fields().unwrap().is_empty());
+        assert!(!session.can_undo());
+    }
+
+    #[test]
+    fn every_inserted_item_draws_without_syntax_errors() {
+        let dir = crate::testkit::TempDir::new("insert-all");
+        let source = dir.join("blank.pdf");
+        create_blank_pdf(&source).unwrap();
+        let image = dir.join("pixel.png");
+        fs::write(
+            &image,
+            crate::infra::png::encode_rgb(2, 1, &[255, 0, 0, 0, 0, 255]).unwrap(),
+        )
+        .unwrap();
+        let mut session = PdfSession::open(&source).unwrap();
+        session
+            .insert_visible_text_at("Texto “livre” – 5 €", 72.0, 800.0, 14.0)
+            .unwrap();
+        session.add_text_note_at("Nota", 400.0, 800.0).unwrap();
+        session.highlight_at(72.0, 790.0, 120.0, 20.0).unwrap();
+        session
+            .insert_image_at(&image, 300.0, 700.0, 60.0, 30.0)
+            .unwrap();
+        session
+            .insert_text_field("nome", "Maria", 72.0, 700.0, 200.0, 28.0, false)
+            .unwrap();
+        session
+            .insert_text_field("obs", "Linha 1\nLinha 2", 72.0, 640.0, 200.0, 50.0, true)
+            .unwrap();
+        session
+            .insert_checkbox("marcada", true, 72.0, 600.0, 18.0)
+            .unwrap();
+        session
+            .insert_checkbox("vazia", false, 120.0, 600.0, 18.0)
+            .unwrap();
+        let options = vec![
+            ("Pix".to_string(), 72.0, 560.0, 18.0, 18.0),
+            ("Boleto".to_string(), 72.0, 532.0, 18.0, 18.0),
+        ];
+        session
+            .insert_radio_group("pagamento", &options, Some(0))
+            .unwrap();
+        let states = ["SP".to_string(), "RJ".to_string()];
+        session
+            .insert_choice_field("uf", "SP", &states, 72.0, 480.0, 160.0, 26.0, true)
+            .unwrap();
+        session
+            .insert_choice_field("lista", "RJ", &states, 260.0, 440.0, 160.0, 60.0, false)
+            .unwrap();
+        session.set_radio_value("pagamento", "Boleto").unwrap();
+        session.set_checkbox_value("vazia", true).unwrap();
+        session
+            .set_text_field_value("nome", "Ana (R$) \\ fim")
+            .unwrap();
+        session.set_choice_value("uf", "RJ").unwrap();
+        let errors = poppler_syntax_errors(session.work_path());
+        if let Ok(keep) = std::env::var("RUSTPDF_KEEP_RENDER") {
+            fs::copy(session.work_path(), keep).unwrap();
+        }
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_over_a_private_file_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::testkit::TempDir::new("save-mode");
+        let source = dir.join("privado.pdf");
+        create_blank_pdf(&source).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut session = PdfSession::open(&source).unwrap();
+        session.rotate_current().unwrap();
+        session.save_as(&source).unwrap();
+        let mode = fs::metadata(&source).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
     #[test]
     fn radio_and_choice_fields_are_valid_acroform_widgets() {
         let dir = crate::testkit::TempDir::new("radio-test");
@@ -2428,6 +3033,14 @@ mod tests {
             ("Não".to_string(), 72.0, 670.0, 20.0, 20.0),
             ("Talvez".to_string(), 72.0, 640.0, 20.0, 20.0),
         ];
+        // Rótulos que dariam o mesmo nome de estado acenderiam juntos.
+        let colliding = vec![
+            ("Sim!".to_string(), 300.0, 700.0, 20.0, 20.0),
+            ("Sim?".to_string(), 300.0, 670.0, 20.0, 20.0),
+        ];
+        assert!(session
+            .insert_radio_group("duplo", &colliding, None)
+            .is_err());
         session
             .insert_radio_group("escolha", &options, Some(0))
             .unwrap();
@@ -2435,7 +3048,7 @@ mod tests {
             .insert_choice_field(
                 "estado",
                 "Aberto",
-                &["Aberto".into(), "Fechado".into(), "Pendente".into()],
+                &["Aberto".into(), "Fechado".into(), "Belém".into()],
                 72.0,
                 580.0,
                 220.0,
@@ -2463,6 +3076,7 @@ mod tests {
             "Linha 1\nLinha 2".into()
         )));
         session.set_radio_value("escolha", "Não").unwrap();
+        session.set_choice_value("estado", "Belém").unwrap();
         session.set_choice_value("estado", "Fechado").unwrap();
         let fields = session.list_form_fields().unwrap();
         assert!(fields.contains(&("escolha".into(), "rádio".into(), "/OptNo".into())));
@@ -2477,6 +3091,10 @@ mod tests {
         .unwrap();
         assert!(json.contains("\"/FT\": \"/Btn\""));
         assert!(json.contains("\"/FT\": \"/Ch\""));
+        // Radio (bit 16) | NoToggleToOff (bit 15); nunca ReadOnly/Required.
+        assert!(json.contains("\"/Ff\": 49152"), "bandeiras do rádio");
+        // Opções em texto PDF (UTF-16), não UTF-8 cru.
+        assert!(json.contains("\"u:Belém\""), "opção acentuada");
         assert!(json.contains("/Kids"));
         assert!(json.contains("/Opt"));
         run(
@@ -2489,6 +3107,7 @@ mod tests {
         .unwrap();
         let painted = fs::read(session.render(800).unwrap()).unwrap();
         assert!(!painted.is_empty());
+        session.undo().unwrap();
         session.undo().unwrap();
         session.undo().unwrap();
         let fields = session.list_form_fields().unwrap();
@@ -2888,6 +3507,9 @@ mod mouse_hit_tests {
             hit.rect
         );
         assert!(session.text_at(400.0, 600.0).unwrap().is_none());
+        let lines = session.page_text_lines().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], hit.rect);
         let (run, editable) = session
             .text_run_at((140.0, 305.0), &hit.word)
             .unwrap()
@@ -2898,6 +3520,47 @@ mod mouse_hit_tests {
             .replace_text_at((140.0, 305.0), &hit.word, "Tchau")
             .unwrap();
         assert!(session.extract_text().unwrap().contains("Tchau"));
+    }
+
+    #[test]
+    fn edits_hex_text_of_subset_font_through_to_unicode() {
+        // Fonte embutida como subconjunto (LibreOffice, pypdf): códigos
+        // arbitrários em strings hexadecimais, só o /ToUnicode diz o texto.
+        let dir = crate::testkit::TempDir::new("subset-font");
+        let input = dir.join("subset.pdf");
+        let mut pdf = crate::testkit::PdfBuilder::new();
+        let cmap = pdf.stream(
+            "",
+            b"1 begincodespacerange <00> <FF> endcodespacerange\n\
+              3 beginbfchar <01> <004F> <02> <006C> <03> <0061> endbfchar",
+        );
+        let font = pdf.object(format!(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 1 /LastChar 3 \
+             /Widths [778 222 556] /ToUnicode {cmap} >>"
+        ));
+        pdf.page(
+            595.0,
+            842.0,
+            &format!("/Font << /F1-0 {font} >>"),
+            "q 0 0 0 rg BT 100 300 Td /F1-0 20 Tf[<01>2<02>-1<03>]TJ ET Q",
+        );
+        pdf.write(&input);
+        let mut session = PdfSession::open(&input).unwrap();
+        let hit = session.text_at(110.0, 305.0).unwrap().expect("texto");
+        let (run, editable) = session
+            .text_run_at((110.0, 305.0), &hit.word)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run, "Ola");
+        assert!(editable);
+        let error = session
+            .replace_text_at((110.0, 305.0), &hit.word, "Olá")
+            .unwrap_err();
+        assert!(error.contains("“á”"), "{error}");
+        session
+            .replace_text_at((110.0, 305.0), &hit.word, "alO")
+            .unwrap();
+        assert!(session.extract_text().unwrap().contains("alO"));
     }
 
     #[test]

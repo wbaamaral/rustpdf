@@ -4,6 +4,8 @@
 #![forbid(unsafe_code)]
 
 pub mod exportacao;
+pub mod fonte;
+pub mod formularios;
 pub mod geometria;
 pub mod layout;
 pub mod paginas;

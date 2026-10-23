@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Leitura e edição do conteúdo desenhado da página: textos e imagens.
+use crate::dominio::fonte::{FontCodec, ToUnicode};
 use crate::images;
-use crate::infra::qpdf::{ffi::*, path_c, Document};
+use crate::infra::qpdf::{dict_keys, ffi::*, path_c, Document};
 use crate::textmove::{self, FormXObject, Frame, Interpreter, Matrix, XObject};
 use crate::AppResult;
+use std::collections::HashMap;
 use std::ffi::{c_int, CStr, CString};
 use std::path::Path;
 use std::ptr;
@@ -398,23 +400,6 @@ fn xobject_dictionary(doc: &Document, owner: u32) -> AppResult<u32> {
     Ok(xobjects)
 }
 
-fn dict_keys(doc: &Document, dict: u32) -> Vec<String> {
-    let mut keys = Vec::new();
-    unsafe { qpdf_oh_begin_dict_key_iter(doc.0, dict) };
-    while unsafe { qpdf_oh_dict_more_keys(doc.0) } != 0 {
-        let key = unsafe { qpdf_oh_dict_next_key(doc.0) };
-        if key.is_null() {
-            break;
-        }
-        keys.push(
-            unsafe { CStr::from_ptr(key) }
-                .to_string_lossy()
-                .into_owned(),
-        );
-    }
-    keys
-}
-
 /// Imagens XObject, incluindo aninhadas em formulários.
 fn collect_images(
     doc: &Document,
@@ -642,6 +627,93 @@ fn interpret_page<'d>(
     Ok(interpreter)
 }
 
+/// Dicionário da fonte `/name` nos recursos de `owner` (página ou form); um
+/// form sem `/Resources` próprio herda os da página.
+fn font_dictionary(doc: &Document, page: u32, owner: u32, name: &str) -> Option<u32> {
+    let lookup = |holder: u32| -> Option<u32> {
+        let dict = if unsafe { qpdf_oh_is_stream(doc.0, holder) } != 0 {
+            unsafe { qpdf_oh_get_dict(doc.0, holder) }
+        } else {
+            holder
+        };
+        let resources = unsafe { qpdf_oh_get_key(doc.0, dict, c"/Resources".as_ptr()) };
+        let fonts = unsafe { qpdf_oh_get_key(doc.0, resources, c"/Font".as_ptr()) };
+        if unsafe { qpdf_oh_is_dictionary(doc.0, fonts) } == 0 {
+            return None;
+        }
+        let font = unsafe { qpdf_oh_get_key(doc.0, fonts, key_cstr(name).as_ptr()) };
+        (unsafe { qpdf_oh_is_dictionary(doc.0, font) } != 0).then_some(font)
+    };
+    lookup(owner).or_else(|| lookup(page))
+}
+
+/// Codificação da fonte: o `/ToUnicode` quando existe; senão WinAnsi para
+/// fontes simples com `/WinAnsiEncoding`. `None` nos demais casos (fonte
+/// composta sem `/ToUnicode`, `/Differences`, Type 3, StandardEncoding…).
+fn font_codec(doc: &Document, font: u32) -> Option<FontCodec> {
+    let is_name = |object: u32, name: &CStr| unsafe {
+        qpdf_oh_is_name_and_equals(doc.0, object, name.as_ptr()) != 0
+    };
+    let to_unicode = unsafe { qpdf_oh_get_key(doc.0, font, c"/ToUnicode".as_ptr()) };
+    if unsafe { qpdf_oh_is_stream(doc.0, to_unicode) } != 0 {
+        if let Some(map) = read_stream_data(doc, to_unicode)
+            .ok()
+            .and_then(|cmap| ToUnicode::parse(&cmap))
+        {
+            return Some(FontCodec::ToUnicode(map));
+        }
+    }
+    let subtype = unsafe { qpdf_oh_get_key(doc.0, font, c"/Subtype".as_ptr()) };
+    if is_name(subtype, c"/Type0") || is_name(subtype, c"/Type3") {
+        return None;
+    }
+    let encoding = unsafe { qpdf_oh_get_key(doc.0, font, c"/Encoding".as_ptr()) };
+    let encoding = if unsafe { qpdf_oh_is_dictionary(doc.0, encoding) } != 0 {
+        let differences = unsafe { qpdf_oh_get_key(doc.0, encoding, c"/Differences".as_ptr()) };
+        if unsafe { qpdf_oh_is_null(doc.0, differences) } == 0 {
+            return None;
+        }
+        unsafe { qpdf_oh_get_key(doc.0, encoding, c"/BaseEncoding".as_ptr()) }
+    } else {
+        encoding
+    };
+    // StandardEncoding, a codificação própria de fontes embutidas e as
+    // simbólicas não são Latin-1 acima de 0x7F: ficam no caminho antigo.
+    is_name(encoding, c"/WinAnsiEncoding").then_some(FontCodec::WinAnsi)
+}
+
+/// Codificações das fontes usadas pelos trechos, por (stream, fonte).
+struct Fonts(HashMap<(usize, String), Option<FontCodec>>);
+
+impl Fonts {
+    fn of(&self, run: &textmove::TextRunPlacement) -> Option<&FontCodec> {
+        self.0
+            .get(&(run.stream, run.font.clone()))
+            .and_then(Option::as_ref)
+    }
+}
+
+/// Resolve a fonte de cada trecho e guarda o texto decodificado por ela.
+fn decode_runs<F>(doc: &Document, page: u32, interpreter: &mut Interpreter<F>) -> Fonts
+where
+    F: FnMut(u32, &str) -> XObject,
+{
+    let mut fonts = Fonts(HashMap::new());
+    for run in &mut interpreter.runs {
+        let owner = interpreter.streams[run.stream].0;
+        let codec = fonts
+            .0
+            .entry((run.stream, run.font.clone()))
+            .or_insert_with(|| {
+                font_dictionary(doc, page, owner, &run.font).and_then(|font| font_codec(doc, font))
+            });
+        if let Some(codec) = codec {
+            run.decoded = Some(codec.decode(&run.shown_bytes()));
+        }
+    }
+    fonts
+}
+
 /// Texto do trecho sob (`x`, `y`) e se ele pode ser reescrito.
 pub fn page_text_run(
     input: &Path,
@@ -652,12 +724,18 @@ pub fn page_text_run(
 ) -> AppResult<Option<(String, bool)>> {
     let doc = Document::new()?;
     let page = open_page(&doc, input, page_number)?;
-    let interpreter = interpret_page(&doc, page)?;
+    doc.check(unsafe { qpdf_push_inherited_attributes_to_page(doc.0) })?;
+    let mut interpreter = interpret_page(&doc, page)?;
+    let fonts = decode_runs(&doc, page, &mut interpreter);
     Ok(
         textmove::nearest_unit(&interpreter.runs, x, y, clicked_text).map(|unit| {
             // Bloco letra a letra: reescrever o texto não é suportado.
             let editable = !unit.block
-                && textmove::run_is_editable(&interpreter.streams[unit.run.stream].1, &unit.run);
+                && textmove::run_is_editable(
+                    &interpreter.streams[unit.run.stream].1,
+                    &unit.run,
+                    fonts.of(&unit.run),
+                );
             (unit.text, editable)
         }),
     )
@@ -677,7 +755,9 @@ pub fn page_text_frame(
 ) -> AppResult<Option<(Frame, String, bool)>> {
     let doc = Document::new()?;
     let page = open_page(&doc, input, page_number)?;
-    let interpreter = interpret_page(&doc, page)?;
+    doc.check(unsafe { qpdf_push_inherited_attributes_to_page(doc.0) })?;
+    let mut interpreter = interpret_page(&doc, page)?;
+    decode_runs(&doc, page, &mut interpreter);
     let Some(unit) = textmove::nearest_unit(&interpreter.runs, x, y, clicked_text) else {
         return Ok(None);
     };
@@ -685,13 +765,38 @@ pub fn page_text_frame(
         .width
         .unwrap_or_else(|| textmove::measure_run_width(&unit.run, words));
     let mut labelled = unit.run.clone();
-    labelled.text = unit.text.clone();
+    labelled.decoded = Some(unit.text.clone());
     let text = textmove::readable_text(&labelled, clicked_text);
     Ok(Some((
         textmove::run_frame(&unit.run, width),
         text,
         unit.block,
     )))
+}
+
+/// Moldura e texto de cada trecho de texto da página (espaço padrão), na
+/// ordem do conteúdo. `words` como em [`page_text_frame`].
+pub fn page_text_frames(
+    input: &Path,
+    page_number: usize,
+    words: &[(String, [f64; 4])],
+) -> AppResult<Vec<(Frame, String)>> {
+    let doc = Document::new()?;
+    let page = open_page(&doc, input, page_number)?;
+    doc.check(unsafe { qpdf_push_inherited_attributes_to_page(doc.0) })?;
+    let mut interpreter = interpret_page(&doc, page)?;
+    decode_runs(&doc, page, &mut interpreter);
+    Ok(textmove::text_units(&interpreter.runs)
+        .into_iter()
+        .filter(|unit| !unit.text.trim().is_empty())
+        .map(|unit| {
+            let width = unit
+                .width
+                .unwrap_or_else(|| textmove::measure_run_width(&unit.run, words));
+            let text = textmove::readable_text(&unit.run, "");
+            (textmove::run_frame(&unit.run, width), text)
+        })
+        .collect())
 }
 
 /// Imagem desenhada sob (`x`, `y`): nome e moldura da ocorrência mais acima.
@@ -760,7 +865,7 @@ where
             .unwrap_or_else(|| interpreter.streams[parent].1.clone());
         let (start, end) = invocation.name_span;
         let mut renamed = parent_content[..start].to_vec();
-        renamed.extend_from_slice(format!("/{name}").as_bytes());
+        renamed.extend_from_slice(format!("/{}", textmove::encode_name(&name)).as_bytes());
         renamed.extend_from_slice(&parent_content[end..]);
         updated.push((parent, targets[parent], renamed));
         targets[current] = clone;
@@ -807,7 +912,8 @@ pub fn edit_page_text(
     let page = open_page(&doc, input, page_number)?;
     // Recursos herdados de /Pages passam para cada página antes da análise.
     doc.check(unsafe { qpdf_push_inherited_attributes_to_page(doc.0) })?;
-    let interpreter = interpret_page(&doc, page)?;
+    let mut interpreter = interpret_page(&doc, page)?;
+    let fonts = decode_runs(&doc, page, &mut interpreter);
     let unit = textmove::nearest_unit(&interpreter.runs, x, y, clicked_text)
         .ok_or("Texto não localizado no conteúdo da página")?;
     if unit.block && matches!(edit, TextEdit::Replace(_)) {
@@ -826,7 +932,9 @@ pub fn edit_page_text(
         &interpreter,
         run.stream,
         |source| match (&edit, transform) {
-            (TextEdit::Replace(text), _) => textmove::replace_run_text(source, &run, text),
+            (TextEdit::Replace(text), _) => {
+                textmove::replace_run_text(source, &run, text, fonts.of(&run))
+            }
             (_, Some(matrix)) => {
                 let (edited, whole) = textmove::transform_run(source, &run, &matrix)?;
                 // Numa palavra desenhada letra a letra o bloco é a própria unidade.

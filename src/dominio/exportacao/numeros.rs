@@ -63,7 +63,20 @@ fn number(text: &str) -> Option<f64> {
             None => digits.to_string(),
         },
     };
-    format!("{sign}{normalized}").parse().ok()
+    // Acima de 15 dígitos significativos o f64 (e a planilha) perde dígitos:
+    // chave de NF-e, código de barras e afins ficam como texto.
+    let significant = normalized
+        .chars()
+        .filter(char::is_ascii_digit)
+        .skip_while(|digit| *digit == '0')
+        .count();
+    if significant > 15 {
+        return None;
+    }
+    format!("{sign}{normalized}")
+        .parse()
+        .ok()
+        .filter(|value: &f64| value.is_finite())
 }
 
 fn plain(text: &str) -> bool {
@@ -111,6 +124,21 @@ mod tests {
         assert_eq!(cell_value("R$-3,10"), CellValue::Currency(-3.1));
         assert_eq!(cell_value("15%"), CellValue::Percent(0.15));
         assert_eq!(cell_value("12,5 %"), CellValue::Percent(0.125));
+    }
+
+    #[test]
+    fn long_digit_runs_stay_text() {
+        // Chave de NF-e, código de barras: o f64 perderia dígitos.
+        let key = "35190612345678000123550010000012341000012345";
+        assert_eq!(cell_value(key), CellValue::Text(key.into()));
+        assert_eq!(
+            cell_value(&"9".repeat(400)),
+            CellValue::Text("9".repeat(400))
+        );
+        assert_eq!(
+            cell_value("123456789012345"),
+            CellValue::Number(123456789012345.0)
+        );
     }
 
     #[test]

@@ -74,7 +74,10 @@ impl Renderer for Poppler {
         args.extend(scale_to_width(width));
         args.extend([pdf.into(), prefix.clone().into_os_string()]);
         run("pdftoppm", &args)?;
-        let produced = prefix.with_extension("png");
+        // `with_extension` trocaria o “.1” de `pagina.1` em vez de acrescentar.
+        let mut produced = prefix.into_os_string();
+        produced.push(".png");
+        let produced = std::path::PathBuf::from(produced);
         if produced != destination {
             crate::replace_file(&produced, destination).map_err(|e| ToolError::Failed {
                 program: "pdftoppm".into(),
@@ -92,6 +95,12 @@ impl Renderer for Poppler {
         dpi: u32,
     ) -> Result<Vec<u8>, ToolError> {
         let pixels = |points: f64| ((points * f64::from(dpi) / 72.0).round() as i64).to_string();
+        // `-W 0`/`-H 0` no pdftoppm significa “até a borda da página”.
+        let extent = |points: f64| {
+            ((points * f64::from(dpi) / 72.0).round() as i64)
+                .max(1)
+                .to_string()
+        };
         let failure = |e: std::io::Error| ToolError::Failed {
             program: "pdftoppm".into(),
             detail: e.to_string(),
@@ -109,9 +118,9 @@ impl Renderer for Poppler {
             "-y".into(),
             pixels(region.top()).into(),
             "-W".into(),
-            pixels(region.width()).into(),
+            extent(region.width()).into(),
             "-H".into(),
-            pixels(region.height()).into(),
+            extent(region.height()).into(),
         ]);
         args.extend([pdf.into(), prefix.clone().into_os_string()]);
         let result = run("pdftoppm", &args)

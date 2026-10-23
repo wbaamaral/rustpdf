@@ -3,14 +3,21 @@
 //! permitir compilação offline, sem crates externas.
 // No Windows a interface não abre janela de console.
 #![cfg_attr(windows, windows_subsystem = "windows")]
+mod dialogos;
+mod edicao_inline;
 mod icons;
+mod menu_contexto;
+mod preencher;
+mod selecao_multipla;
 mod shell;
 
+use rustpdf::apresentacao::arraste::DragGate;
 use rustpdf::apresentacao::exportacao::{self, ExportFormat};
+use rustpdf::apresentacao::formularios;
+use rustpdf::apresentacao::selecao::{self as regras_selecao, Mode as SelectionMode};
 use rustpdf::textmove::{self, IDENTITY};
 use rustpdf::{
-    is_encrypted, parse_checkbox_state, AppResult, Matrix, Occurrence, PdfSession, Selection,
-    TextEditOutcome,
+    is_encrypted, AppResult, Matrix, Occurrence, PdfSession, Selection, TextEditOutcome,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
@@ -71,14 +78,6 @@ extern "C" {
     fn gtk_file_filter_add_pattern(filter: *mut c_void, pattern: *const c_char);
     fn gtk_file_filter_add_mime_type(filter: *mut c_void, mime_type: *const c_char);
     fn gtk_dialog_run(dialog: *mut c_void) -> c_int;
-    fn gtk_message_dialog_new(
-        parent: *mut c_void,
-        flags: c_int,
-        message_type: c_int,
-        buttons: c_int,
-        message_format: *const c_char,
-        ...
-    ) -> *mut c_void;
     fn gtk_text_view_new() -> *mut c_void;
     fn gtk_text_view_set_editable(view: *mut c_void, setting: c_int);
     fn gtk_text_view_set_wrap_mode(view: *mut c_void, mode: c_int);
@@ -122,6 +121,8 @@ extern "C" {
 
 /// `GDK_SHIFT_MASK` em `GdkModifierType`.
 const GDK_SHIFT_MASK: u32 = 1;
+/// `GDK_CONTROL_MASK` em `GdkModifierType`.
+const GDK_CONTROL_MASK: u32 = 1 << 2;
 
 /// `GDK_2BUTTON_PRESS`: segundo clique de um clique duplo.
 const GDK_DOUBLE_BUTTON_PRESS: c_int = 5;
@@ -222,9 +223,22 @@ enum DragState {
         mode: TransformMode,
         start: (f64, f64),
         selection: Selection,
+        /// Só vira arraste depois do limiar em pixels (tremor do clique não move).
+        gate: DragGate,
     },
     Highlight {
         start: (f64, f64),
+    },
+    /// Retângulo de seleção (ou Ctrl+clique, se não passar do limiar).
+    Marquee {
+        start: (f64, f64),
+        mode: SelectionMode,
+        gate: DragGate,
+    },
+    /// Arrastar o grupo selecionado.
+    MoveGroup {
+        start: (f64, f64),
+        gate: DragGate,
     },
 }
 
@@ -495,17 +509,7 @@ fn chooser(title: &str, save: bool, kind: FileKind) -> Option<PathBuf> {
 }
 
 fn confirm(message: &str) -> bool {
-    let parent = STATE.with(|cell| cell.borrow().as_ref().map(|app| app.window));
-    let Some(parent) = parent else {
-        return false;
-    };
-    let message = cstring(message);
-    unsafe {
-        let dialog = gtk_message_dialog_new(parent, 1, 2, 4, message.as_ptr());
-        let accepted = gtk_dialog_run(dialog) == -8;
-        gtk_widget_destroy(dialog);
-        accepted
-    }
+    dialogos::confirm(message)
 }
 
 fn prompt_text(message: &str) -> Option<String> {
@@ -513,73 +517,15 @@ fn prompt_text(message: &str) -> Option<String> {
 }
 
 fn prompt_text_default(message: &str, default: &str) -> Option<String> {
-    let parent = STATE.with(|cell| cell.borrow().as_ref().map(|app| app.window))?;
-    let message = cstring(message);
-    unsafe {
-        let dialog = gtk_message_dialog_new(parent, 1, 3, 5, message.as_ptr());
-        let entry = gtk_entry_new();
-        gtk_entry_set_text(entry, cstring(default).as_ptr());
-        // Enter no campo confirma (OK), como nos diálogos padrão.
-        gtk_entry_set_activates_default(entry, 1);
-        gtk_dialog_set_default_response(dialog, -5);
-        gtk_container_add(gtk_dialog_get_content_area(dialog), entry);
-        gtk_widget_show_all(dialog);
-        let text = if gtk_dialog_run(dialog) == -5 {
-            let value = gtk_entry_get_text(entry);
-            if value.is_null() {
-                None
-            } else {
-                Some(CStr::from_ptr(value).to_string_lossy().into_owned())
-            }
-        } else {
-            None
-        };
-        gtk_widget_destroy(dialog);
-        text
-    }
+    dialogos::prompt_text_default(message, default)
 }
 
 fn prompt_password() -> Option<String> {
-    let parent = STATE.with(|cell| cell.borrow().as_ref().map(|app| app.window))?;
-    unsafe {
-        let dialog = gtk_message_dialog_new(parent, 1, 3, 5, c"Senha do PDF:".as_ptr());
-        let entry = gtk_entry_new();
-        gtk_entry_set_visibility(entry, 0);
-        gtk_entry_set_activates_default(entry, 1);
-        gtk_dialog_set_default_response(dialog, -5);
-        gtk_container_add(gtk_dialog_get_content_area(dialog), entry);
-        gtk_widget_show_all(dialog);
-        let password = if gtk_dialog_run(dialog) == -5 {
-            let value = gtk_entry_get_text(entry);
-            if value.is_null() {
-                None
-            } else {
-                Some(CStr::from_ptr(value).to_string_lossy().into_owned())
-            }
-        } else {
-            None
-        };
-        gtk_widget_destroy(dialog);
-        password
-    }
+    dialogos::prompt_password()
 }
 
 fn show_text(title: &str, content: &str) {
-    unsafe {
-        let window = gtk_window_new(0);
-        gtk_window_set_title(window, cstring(title).as_ptr());
-        gtk_window_set_default_size(window, 700, 550);
-        let scroll = gtk_scrolled_window_new(ptr::null_mut(), ptr::null_mut());
-        let view = gtk_text_view_new();
-        gtk_text_view_set_editable(view, 0);
-        gtk_text_view_set_wrap_mode(view, 2);
-        let buffer = gtk_text_view_get_buffer(view);
-        let len = content.len().min(c_int::MAX as usize) as c_int;
-        gtk_text_buffer_set_text(buffer, content.as_ptr().cast(), len);
-        gtk_container_add(scroll, view);
-        gtk_container_add(window, scroll);
-        gtk_widget_show_all(window);
-    }
+    dialogos::show_text(title, content);
 }
 
 unsafe fn clear_children(container: *mut c_void) {
@@ -983,28 +929,9 @@ fn dispatch(action: usize) -> AppResult<()> {
             }
         }
         25 => shell::activate_tool(ToolMode::TextField),
-        26 => {
-            let Some(name) = prompt_text("Nome do campo de texto a preencher:") else {
-                return Ok(());
-            };
-            let Some(value) = prompt_text("Novo valor do campo:") else {
-                return Ok(());
-            };
-            with_session(|s| s.set_text_field_value(&name, &value))?;
-            render()?;
-        }
+        26 => preencher::fill_from_menu(preencher::Wanted::Text)?,
         27 => shell::activate_tool(ToolMode::Checkbox),
-        28 => {
-            let Some(name) = prompt_text("Nome da caixa de seleção a alterar:") else {
-                return Ok(());
-            };
-            let Some(value) = prompt_text_default("Novo estado (sim/não):", "sim") else {
-                return Ok(());
-            };
-            let checked = parse_checkbox_state(&value)?;
-            with_session(|s| s.set_checkbox_value(&name, checked))?;
-            render()?;
-        }
+        28 => preencher::fill_from_menu(preencher::Wanted::Checkbox)?,
         29 => {
             let fields = with_session(|s| s.list_form_fields())?;
             let content = if fields.is_empty() {
@@ -1019,27 +946,9 @@ fn dispatch(action: usize) -> AppResult<()> {
             show_text("Campos do formulário", &content);
         }
         33 => shell::activate_tool(ToolMode::Radio),
-        34 => {
-            let Some(name) = prompt_text("Nome do rádio a alterar:") else {
-                return Ok(());
-            };
-            let Some(selection) = prompt_text("Opção a selecionar:") else {
-                return Ok(());
-            };
-            with_session(|s| s.set_radio_value(&name, selection.trim()))?;
-            render()?;
-        }
+        34 => preencher::fill_from_menu(preencher::Wanted::Radio)?,
         35 => shell::activate_tool(ToolMode::Choice),
-        36 => {
-            let Some(name) = prompt_text("Nome do campo de escolha a alterar:") else {
-                return Ok(());
-            };
-            let Some(value) = prompt_text("Novo valor (precisa estar nas opções):") else {
-                return Ok(());
-            };
-            with_session(|s| s.set_choice_value(&name, value.trim()))?;
-            render()?;
-        }
+        36 => preencher::fill_from_menu(preencher::Wanted::Choice)?,
         37 => {
             let runs = with_session(|s| s.list_text_runs())?;
             let content = if runs.is_empty() {
@@ -1234,6 +1143,7 @@ fn dispatch(action: usize) -> AppResult<()> {
             with_session(|s| s.rotate_current_by(-90))?;
             render()?;
         }
+        58 if selecao_multipla::active() => selecao_multipla::delete_group()?,
         58 => {
             let Some(selection) = current_selection() else {
                 return Err("Nada selecionado".into());
@@ -1374,6 +1284,8 @@ fn set_tool(tool: ToolMode) {
 
 /// Define a seleção visível (moldura com alças) e redesenha.
 fn set_selection(selection: Option<Selection>) {
+    // Seleção simples (ou nenhuma) substitui o grupo.
+    selecao_multipla::forget();
     STATE.with(|cell| {
         if let Some(app) = cell.borrow_mut().as_mut() {
             app.selection = selection;
@@ -1486,6 +1398,20 @@ impl PageMapping {
     }
 }
 
+fn start_drag(drag: DragState) {
+    STATE.with(|cell| {
+        if let Some(app) = cell.borrow_mut().as_mut() {
+            app.drag = Some(drag);
+        }
+    });
+}
+
+/// Posição do evento em pixels da janela do widget que o recebeu.
+fn event_coords(event: *mut c_void) -> Option<(f64, f64)> {
+    let (mut x, mut y) = (0.0, 0.0);
+    (unsafe { gdk_event_get_coords(event, &mut x, &mut y) } != 0).then_some((x, y))
+}
+
 /// Posição do evento em pixels do widget da prévia.
 fn event_image_coords(event_box: *mut c_void, event: *mut c_void) -> Option<(f64, f64)> {
     let (mut x, mut y) = (0.0, 0.0);
@@ -1505,6 +1431,16 @@ fn event_image_coords(event_box: *mut c_void, event: *mut c_void) -> Option<(f64
         )
     };
     (translated != 0).then_some((image_x as f64, image_y as f64))
+}
+
+/// Modo de seleção pelas teclas do evento (Ctrl inclui, Ctrl+Shift retira).
+fn selection_mode(event: *mut c_void) -> SelectionMode {
+    let mut state = 0u32;
+    let known = unsafe { gdk_event_get_state(event, &mut state) } != 0;
+    regras_selecao::mode(
+        known && state & GDK_CONTROL_MASK != 0,
+        known && state & GDK_SHIFT_MASK != 0,
+    )
 }
 
 fn shift_pressed(event: *mut c_void) -> bool {
@@ -1693,29 +1629,120 @@ unsafe fn path_polygon(cr: *mut c_void, points: &[(f64, f64)]) {
     cairo_close_path(cr);
 }
 
-const BLUE: (f64, f64, f64) = (0.10, 0.45, 0.95);
+/// Cor de destaque da seleção e opacidade do preenchimento.
+const ACCENT: (f64, f64, f64) = (0.17, 0.47, 0.93);
+const ACCENT_FILL: f64 = 0.07;
+/// Lado das alças de redimensionar, em pixels.
+const HANDLE: f64 = 8.0;
 
-/// Contorno claro sob o tracejado azul: visível sobre qualquer fundo.
-unsafe fn stroke_dashed(cr: *mut c_void, points: &[(f64, f64)], fill: bool) {
-    path_polygon(cr, points);
-    if fill {
-        cairo_set_source_rgba(cr, BLUE.0, BLUE.1, BLUE.2, 0.10);
+/// Contorno contínuo com halo branco por baixo (visível sobre qualquer
+/// fundo) e preenchimento translúcido.
+unsafe fn outline(cr: *mut c_void, points: &[(f64, f64)], fill_alpha: f64, width: f64) {
+    if fill_alpha > 0.0 {
+        path_polygon(cr, points);
+        cairo_set_source_rgba(cr, ACCENT.0, ACCENT.1, ACCENT.2, fill_alpha);
         cairo_fill_preserve(cr);
+        cairo_new_path(cr);
     }
-    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.9);
+    path_polygon(cr, points);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.85);
+    cairo_set_line_width(cr, width + 2.0);
+    cairo_stroke(cr);
+    path_polygon(cr, points);
+    cairo_set_source_rgba(cr, ACCENT.0, ACCENT.1, ACCENT.2, 1.0);
+    cairo_set_line_width(cr, width);
+    cairo_stroke(cr);
+}
+
+/// Tracejado fino (retângulo de seleção, caixa do grupo, destaque).
+unsafe fn dotted(cr: *mut c_void, points: &[(f64, f64)], fill_alpha: f64) {
+    if fill_alpha > 0.0 {
+        path_polygon(cr, points);
+        cairo_set_source_rgba(cr, ACCENT.0, ACCENT.1, ACCENT.2, fill_alpha);
+        cairo_fill_preserve(cr);
+        cairo_new_path(cr);
+    }
+    path_polygon(cr, points);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.8);
     cairo_set_line_width(cr, 3.0);
     cairo_stroke(cr);
-    let dashes = [6.0, 4.0];
+    let dashes = [4.0, 3.0];
     cairo_set_dash(cr, dashes.as_ptr(), dashes.len() as c_int, 0.0);
     path_polygon(cr, points);
-    cairo_set_source_rgba(cr, BLUE.0, BLUE.1, BLUE.2, 1.0);
-    cairo_set_line_width(cr, 1.5);
+    cairo_set_source_rgba(cr, ACCENT.0, ACCENT.1, ACCENT.2, 1.0);
+    cairo_set_line_width(cr, 1.2);
     cairo_stroke(cr);
     cairo_set_dash(cr, ptr::null(), 0, 0.0);
 }
 
+/// Retângulo de cantos arredondados (caminho).
+unsafe fn rounded_rect(cr: *mut c_void, x: f64, y: f64, width: f64, height: f64, radius: f64) {
+    use std::f64::consts::{FRAC_PI_2, PI};
+    cairo_new_path(cr);
+    cairo_arc(cr, x + width - radius, y + radius, radius, -FRAC_PI_2, 0.0);
+    cairo_arc(
+        cr,
+        x + width - radius,
+        y + height - radius,
+        radius,
+        0.0,
+        FRAC_PI_2,
+    );
+    cairo_arc(cr, x + radius, y + height - radius, radius, FRAC_PI_2, PI);
+    cairo_arc(cr, x + radius, y + radius, radius, PI, PI + FRAC_PI_2);
+    cairo_close_path(cr);
+}
+
+/// Alça de redimensionar: quadrado branco arredondado, borda de destaque e
+/// sombra leve.
+unsafe fn resize_handle(cr: *mut c_void, (x, y): (f64, f64)) {
+    let (left, top) = (x - HANDLE / 2.0, y - HANDLE / 2.0);
+    rounded_rect(cr, left, top + 1.0, HANDLE, HANDLE, 2.0);
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.22);
+    cairo_fill_preserve(cr);
+    cairo_new_path(cr);
+    rounded_rect(cr, left, top, HANDLE, HANDLE, 2.0);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
+    cairo_fill_preserve(cr);
+    cairo_set_source_rgba(cr, ACCENT.0, ACCENT.1, ACCENT.2, 1.0);
+    cairo_set_line_width(cr, 1.5);
+    cairo_stroke(cr);
+}
+
+/// Alça de girar: haste fina até um círculo branco com ponto central.
+unsafe fn rotation_handle(cr: *mut c_void, top: (f64, f64), handle: (f64, f64)) {
+    cairo_new_path(cr);
+    cairo_move_to(cr, top.0, top.1);
+    cairo_line_to(cr, handle.0, handle.1);
+    cairo_set_source_rgba(cr, ACCENT.0, ACCENT.1, ACCENT.2, 0.9);
+    cairo_set_line_width(cr, 1.0);
+    cairo_stroke(cr);
+    cairo_new_path(cr);
+    cairo_arc(
+        cr,
+        handle.0,
+        handle.1 + 1.0,
+        6.0,
+        0.0,
+        std::f64::consts::TAU,
+    );
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.22);
+    cairo_fill_preserve(cr);
+    cairo_new_path(cr);
+    cairo_arc(cr, handle.0, handle.1, 6.0, 0.0, std::f64::consts::TAU);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
+    cairo_fill_preserve(cr);
+    cairo_set_source_rgba(cr, ACCENT.0, ACCENT.1, ACCENT.2, 1.0);
+    cairo_set_line_width(cr, 1.5);
+    cairo_stroke(cr);
+    cairo_new_path(cr);
+    cairo_arc(cr, handle.0, handle.1, 2.0, 0.0, std::f64::consts::TAU);
+    cairo_fill_preserve(cr);
+    cairo_new_path(cr);
+}
+
 /// Desenha sobre a prévia a seleção (moldura orientada, alças de tamanho e
-/// de rotação) e o retângulo da ferramenta Destaque.
+/// de rotação), o grupo selecionado e os retângulos de seleção e destaque.
 unsafe extern "C" fn on_image_draw(
     _widget: *mut c_void,
     cr: *mut c_void,
@@ -1735,16 +1762,18 @@ unsafe extern "C" fn on_image_draw(
         return 0;
     };
     cairo_save(cr);
+    menu_contexto::draw_page_selection(cr, mapping);
+    selecao_multipla::draw(cr, mapping);
     if let Some([x0, y0, x1, y1]) = rubber_band {
         let points: Vec<_> = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
             .into_iter()
             .map(|point| mapping.to_widget(point))
             .collect();
-        stroke_dashed(cr, &points, true);
+        dotted(cr, &points, 0.10);
     }
     if let Some(selection) = selection {
         let frame = selection.frame.transformed(&transform);
-        // Moldura com 3 px de folga para fora, nos dois eixos da tela.
+        // Moldura com 5 px de folga para fora, nos dois eixos da tela.
         let center = mapping.to_widget(frame.center());
         let points: Vec<_> = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
             .into_iter()
@@ -1752,35 +1781,16 @@ unsafe extern "C" fn on_image_draw(
                 let (x, y) = mapping.to_widget(frame.point(s, t));
                 let (dx, dy) = (x - center.0, y - center.1);
                 let length = dx.hypot(dy).max(1e-6);
-                (x + dx / length * 3.0, y + dy / length * 3.0)
+                (x + dx / length * 5.0, y + dy / length * 5.0)
             })
             .collect();
-        stroke_dashed(cr, &points, true);
+        outline(cr, &points, ACCENT_FILL, 1.5);
         if selection.rotatable {
             let (handle, top) = rotate_handle(&frame, mapping);
-            cairo_new_path(cr);
-            cairo_move_to(cr, top.0, top.1);
-            cairo_line_to(cr, handle.0, handle.1);
-            cairo_set_source_rgba(cr, BLUE.0, BLUE.1, BLUE.2, 1.0);
-            cairo_set_line_width(cr, 1.5);
-            cairo_stroke(cr);
-            cairo_new_path(cr);
-            cairo_arc(cr, handle.0, handle.1, 5.0, 0.0, std::f64::consts::TAU);
-            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
-            cairo_fill_preserve(cr);
-            cairo_set_source_rgba(cr, BLUE.0, BLUE.1, BLUE.2, 1.0);
-            cairo_stroke(cr);
+            rotation_handle(cr, top, handle);
         }
-        const HANDLE: f64 = 7.0;
         for (hx, hy) in resize_handles(&selection) {
-            let (x, y) = mapping.to_widget(frame.point(hx, hy));
-            cairo_new_path(cr);
-            cairo_rectangle(cr, x - HANDLE / 2.0, y - HANDLE / 2.0, HANDLE, HANDLE);
-            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
-            cairo_fill_preserve(cr);
-            cairo_set_source_rgba(cr, BLUE.0, BLUE.1, BLUE.2, 1.0);
-            cairo_set_line_width(cr, 1.5);
-            cairo_stroke(cr);
+            resize_handle(cr, mapping.to_widget(frame.point(hx, hy)));
         }
     }
     cairo_restore(cr);
@@ -1806,8 +1816,8 @@ fn cloned_note(outcome: &TextEditOutcome) -> String {
     }
 }
 
-/// Edita só o trecho de texto sob o ponto, substituindo o literal no conteúdo.
-fn edit_text_at(point: (f64, f64)) -> AppResult<()> {
+/// Trecho de texto editável sob o ponto: palavra clicada e texto do trecho.
+fn locate_text(point: (f64, f64)) -> AppResult<(String, String)> {
     let Some(hit) = with_session(|session| session.text_at(point.0, point.1))? else {
         return Err("Nenhum texto aqui para editar".into());
     };
@@ -1824,17 +1834,62 @@ fn edit_text_at(point: (f64, f64)) -> AppResult<()> {
             hit.line
         ));
     }
-    let Some(new_text) = prompt_text_default("Editar texto:", &run) else {
-        return Ok(());
-    };
-    if new_text == run {
+    Ok((hit.word, run))
+}
+
+/// Edita só o trecho de texto sob o ponto, no lugar (sobre o próprio texto);
+/// texto girado usa a caixa de texto.
+fn edit_text_at(point: (f64, f64)) -> AppResult<()> {
+    let (word, run) = locate_text(point)?;
+    if edicao_inline::begin(point, &word, &run)? {
+        status("Editando texto — Enter ou clique fora confirma, Esc cancela");
         return Ok(());
     }
-    let outcome = with_session(|session| session.replace_text_at(point, &hit.word, &new_text))?;
+    edit_text_in_dialog(point)
+}
+
+/// Edita o trecho sob o ponto numa caixa de texto modal.
+fn edit_text_in_dialog(point: (f64, f64)) -> AppResult<()> {
+    edicao_inline::commit();
+    let (word, run) = locate_text(point)?;
+    let Some(new_text) = dialogos::edit_text(&run) else {
+        status("Edição de texto cancelada");
+        return Ok(());
+    };
+    apply_text_edit(point, &word, &run, &new_text)
+}
+
+/// Grava `new_text` no lugar do trecho `original` sob o ponto.
+fn apply_text_edit(point: (f64, f64), word: &str, original: &str, new_text: &str) -> AppResult<()> {
+    if new_text == original {
+        return Ok(());
+    }
+    let outcome = with_session(|session| session.replace_text_at(point, word, new_text))?;
     render()?;
     // A largura do texto mudou: recalcula a moldura.
     set_selection(with_session(|session| session.select_at(point))?);
     status(&format!("Texto editado{}", cloned_note(&outcome)));
+    Ok(())
+}
+
+/// Nomes dos campos de formulário já existentes (para não repetir).
+fn field_names() -> AppResult<Vec<String>> {
+    Ok(with_session(|s| s.list_form_fields())?
+        .into_iter()
+        .map(|(name, ..)| name)
+        .collect())
+}
+
+/// Depois de inserir: volta à ferramenta Selecionar e seleciona o item novo.
+/// Sem isso o clique seguinte (para ajustar o item) inseria outro e
+/// reabria os diálogos.
+fn finish_insertion(select_point: (f64, f64), message: &str) -> AppResult<()> {
+    render()?;
+    set_tool(ToolMode::None);
+    if let Ok(Some(selection)) = with_session(|s| s.select_at(select_point)) {
+        set_selection(Some(selection));
+    }
+    status(&format!("{message} — ferramenta Selecionar ativa"));
     Ok(())
 }
 
@@ -1850,20 +1905,20 @@ fn place_at(point: (f64, f64)) -> AppResult<()> {
             let Some(size) = prompt_text_default("Tamanho da fonte:", "16") else {
                 return Ok(());
             };
-            let size: f64 = size.trim().parse().map_err(|_| "Tamanho inválido")?;
+            let size: f64 = size
+                .trim()
+                .replace(',', ".")
+                .parse()
+                .map_err(|_| "Tamanho inválido")?;
             with_session(|s| s.insert_visible_text_at(&text, x, y, size))?;
-            render()?;
-            status(&format!("Texto inserido em {x:.0} {y:.0}"));
-            Ok(())
+            finish_insertion((x + size * 0.3, y + size * 0.3), "Texto inserido")
         }
         ToolMode::Note => {
             let Some(text) = prompt_text("Texto da nota:") else {
                 return Ok(());
             };
             with_session(|s| s.add_text_note_at(&text, x, y))?;
-            render()?;
-            status(&format!("Nota adicionada em {x:.0} {y:.0}"));
-            Ok(())
+            finish_insertion(point, "Nota adicionada")
         }
         ToolMode::Image => {
             let path = STATE.with(|cell| {
@@ -1878,78 +1933,86 @@ fn place_at(point: (f64, f64)) -> AppResult<()> {
             let width = (page_width * 0.3).max(24.0);
             let height = (page_height * 0.2).max(24.0);
             with_session(|s| s.insert_image_at(&path, x, y, width, height))?;
-            render()?;
-            status(&format!("Imagem inserida em {x:.0} {y:.0}"));
-            Ok(())
+            finish_insertion((x + width / 2.0, y + height / 2.0), "Imagem inserida")
         }
         ToolMode::TextField => {
-            let Some(name) = prompt_text("Nome do campo:") else {
+            let Some(label) = prompt_text("Nome do campo:") else {
                 return Ok(());
             };
-            let Some(value) = prompt_text("Valor inicial:") else {
+            let name = formularios::field_name(&label, "campo", &field_names()?);
+            let Some(value) = prompt_text("Valor inicial (pode ficar vazio):") else {
                 return Ok(());
             };
             let multiline = confirm("Campo multilinha?");
-            with_session(|s| s.insert_text_field(&name, &value, x, y, 220.0, 30.0, multiline))?;
-            render()?;
-            status("Campo de texto criado");
-            Ok(())
+            let (width, height) = (220.0, if multiline { 60.0 } else { 28.0 });
+            with_session(|s| s.insert_text_field(&name, &value, x, y, width, height, multiline))?;
+            finish_insertion(
+                (x + width / 2.0, y + height / 2.0),
+                &format!("Campo de texto “{name}” criado"),
+            )
         }
         ToolMode::Checkbox => {
-            let Some(name) = prompt_text("Nome da caixa:") else {
-                return Ok(());
-            };
-            with_session(|s| s.insert_checkbox(&name, false, x, y, 24.0))?;
-            render()?;
-            status("Caixa de seleção criada");
-            Ok(())
-        }
-        ToolMode::Radio => {
-            let Some(name) = prompt_text("Nome do grupo de rádio:") else {
-                return Ok(());
-            };
-            let Some(options) = prompt_text("Opções separadas por vírgula (ex.: Sim,Não):")
+            let Some(label) = prompt_text("Rótulo da caixa (texto ao lado; pode ficar vazio):")
             else {
                 return Ok(());
             };
-            let labels: Vec<(String, f64, f64, f64, f64)> = options
-                .split(',')
-                .map(|label| label.trim().to_string())
-                .filter(|label| !label.is_empty())
-                .enumerate()
-                .map(|(index, label)| {
-                    let y = y - index as f64 * 28.0;
-                    (label, x, y, 18.0, 18.0)
-                })
-                .collect();
-            if labels.is_empty() {
-                return Err("Informe ao menos uma opção".into());
+            let name = formularios::field_name(&label, "caixa", &field_names()?);
+            let size = 18.0;
+            with_session(|s| s.insert_labeled_checkbox(&name, &label, false, x, y, size))?;
+            finish_insertion(
+                (x + size / 2.0, y + size / 2.0),
+                &format!("Caixa de seleção “{name}” criada"),
+            )
+        }
+        ToolMode::Radio => {
+            let Some(group) = prompt_text("Nome do grupo (ex.: Forma de pagamento):") else {
+                return Ok(());
+            };
+            let Some(options) = prompt_text("Opções separadas por vírgula (ex.: Sim, Não):")
+            else {
+                return Ok(());
+            };
+            let options = formularios::parse_options(&options);
+            if options.len() < 2 {
+                return Err(
+                    "Informe ao menos duas opções diferentes, separadas por vírgula".into(),
+                );
             }
+            let name = formularios::field_name(&group, "opcoes", &field_names()?);
+            let size = 18.0;
+            let labels: Vec<(String, f64, f64, f64, f64)> = options
+                .into_iter()
+                .enumerate()
+                .map(|(index, label)| (label, x, y - index as f64 * 28.0, size, size))
+                .collect();
             with_session(|s| s.insert_radio_group(&name, &labels, None))?;
-            render()?;
-            status("Grupo de rádio criado");
-            Ok(())
+            finish_insertion(
+                (x + size / 2.0, y + size / 2.0),
+                &format!("Grupo de rádio “{name}” criado com {} opções", labels.len()),
+            )
         }
         ToolMode::Choice => {
-            let Some(name) = prompt_text("Nome do campo de escolha:") else {
+            let Some(label) = prompt_text("Nome do campo de escolha:") else {
                 return Ok(());
             };
             let Some(options) = prompt_text("Opções separadas por vírgula:") else {
                 return Ok(());
             };
-            let labels: Vec<String> = options
-                .split(',')
-                .map(|label| label.trim().to_string())
-                .filter(|label| !label.is_empty())
-                .collect();
-            if labels.is_empty() {
+            let options = formularios::parse_options(&options);
+            let Some(first) = options.first().cloned() else {
                 return Err("Informe ao menos uma opção".into());
-            }
-            let combo = confirm("Usar combo (sim) ou lista (não)?");
-            with_session(|s| s.insert_choice_field(&name, "", &labels, x, y, 180.0, 28.0, combo))?;
-            render()?;
-            status("Campo de escolha criado");
-            Ok(())
+            };
+            let name = formularios::field_name(&label, "escolha", &field_names()?);
+            let combo = confirm("Usar lista suspensa (combo)? Não = lista aberta");
+            let (width, height) = (180.0, if combo { 28.0 } else { 60.0 });
+            // Nasce com a primeira opção: um campo vazio parecia não ter sido inserido.
+            with_session(|s| {
+                s.insert_choice_field(&name, &first, &options, x, y, width, height, combo)
+            })?;
+            finish_insertion(
+                (x + width / 2.0, y + height / 2.0),
+                &format!("Campo de escolha “{name}” criado"),
+            )
         }
         ToolMode::Highlight => Ok(()),
     }
@@ -1962,9 +2025,25 @@ unsafe extern "C" fn on_button_press(
 ) -> c_int {
     let _trace = rustpdf::trace(|| "clique (button-press)".into());
     let mut button = 0u32;
-    if gdk_event_get_button(event, &mut button) == 0 || button != 1 {
+    if gdk_event_get_button(event, &mut button) == 0 {
         return 0;
     }
+    // Clique fora do campo de edição no lugar confirma o texto.
+    if edicao_inline::active() {
+        edicao_inline::commit();
+        return 1;
+    }
+    if button == 3 && current_tool() != ToolMode::Hand {
+        clear_drag();
+        return match preview_point(widget, event, false) {
+            Ok(point) => c_int::from(menu_contexto::open(event, point)),
+            Err(_) => 0,
+        };
+    }
+    if button != 1 {
+        return 0;
+    }
+    menu_contexto::clear_page_selection();
     // Alças podem ficar um pouco fora da página: o ponto é limitado à borda.
     let Ok(point) = preview_point(widget, event, true) else {
         return 0;
@@ -1992,11 +2071,35 @@ unsafe extern "C" fn on_button_press(
             1
         }
         ToolMode::None if gdk_event_get_event_type(event) == GDK_DOUBLE_BUTTON_PRESS => {
-            // Clique duplo em texto existente: editar.
+            // Clique duplo: campo de formulário é preenchido; texto, editado.
             clear_drag();
-            if let Err(error) = edit_text_at(point) {
+            let result = match with_session(|session| session.form_field_at(point)) {
+                Ok(Some(field)) => preencher::fill(field, point),
+                Ok(None) => edit_text_at(point),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
                 status(&error);
             }
+            1
+        }
+        ToolMode::None if selection_mode(event) != SelectionMode::Replace => {
+            // Ctrl/Ctrl+Shift: clique inclui/retira o objeto; arraste, o retângulo.
+            if !inside_page {
+                return 0;
+            }
+            start_drag(DragState::Marquee {
+                start: point,
+                mode: selection_mode(event),
+                gate: DragGate::new(event_coords(event).unwrap_or_default()),
+            });
+            1
+        }
+        ToolMode::None if selecao_multipla::group_contains(point) => {
+            start_drag(DragState::MoveGroup {
+                start: point,
+                gate: DragGate::new(event_coords(event).unwrap_or_default()),
+            });
             1
         }
         ToolMode::None => {
@@ -2018,8 +2121,14 @@ unsafe extern "C" fn on_button_press(
                         (TransformMode::Move, selection)
                     }
                     Ok(None) => {
+                        // Área vazia: arrastar desenha o retângulo de seleção.
                         set_selection(None);
-                        status("Nenhum elemento aqui. Ative uma ferramenta para inserir.");
+                        start_drag(DragState::Marquee {
+                            start: point,
+                            mode: SelectionMode::Replace,
+                            gate: DragGate::new(event_coords(event).unwrap_or_default()),
+                        });
+                        status("Arraste para selecionar vários objetos (Ctrl inclui, Ctrl+Shift retira)");
                         return 1;
                     }
                     Err(error) => {
@@ -2036,8 +2145,12 @@ unsafe extern "C" fn on_button_press(
             if selection.rotatable {
                 hints.push("alça ○ gira");
             }
-            if matches!(selection.target, rustpdf::SelectionTarget::Text { .. }) {
-                hints.push("clique duplo edita");
+            match &selection.target {
+                rustpdf::SelectionTarget::Text { .. } => hints.push("clique duplo edita"),
+                rustpdf::SelectionTarget::Annotation { kind, .. } if kind == "campo" => {
+                    hints.push("clique duplo preenche")
+                }
+                _ => {}
             }
             status(&format!("{} — {}", selection.label(), hints.join("; ")));
             STATE.with(|cell| {
@@ -2046,6 +2159,7 @@ unsafe extern "C" fn on_button_press(
                         mode,
                         start: point,
                         selection,
+                        gate: DragGate::new(event_coords(event).unwrap_or_default()),
                     });
                 }
             });
@@ -2078,7 +2192,8 @@ unsafe extern "C" fn on_motion(
             return 0;
         }
         if current_tool() != ToolMode::None {
-            set_cursor("");
+            // Ferramenta de inserção: a cruz indica que o clique vai inserir.
+            set_cursor("crosshair");
             return 0;
         }
         let cursor = match (
@@ -2104,6 +2219,36 @@ unsafe extern "C" fn on_motion(
         return 0;
     };
     match drag {
+        DragState::Marquee {
+            start,
+            mode,
+            mut gate,
+        } => {
+            let was_dragging = gate.dragging();
+            if !event_coords(event).is_some_and(|position| gate.update(position)) {
+                return 0;
+            }
+            start_drag(DragState::Marquee { start, mode, gate });
+            if !was_dragging {
+                if let Err(error) = selecao_multipla::begin_marquee(mode) {
+                    status(&error);
+                    clear_drag();
+                    return 0;
+                }
+            }
+            selecao_multipla::update_marquee(regras_selecao::rect_between(start, current));
+        }
+        DragState::MoveGroup { start, mut gate } => {
+            if !event_coords(event).is_some_and(|position| gate.update(position)) {
+                return 0;
+            }
+            start_drag(DragState::MoveGroup { start, gate });
+            let (dx, dy) = (current.0 - start.0, current.1 - start.1);
+            selecao_multipla::set_preview(textmove::translation(dx, dy));
+            status(&format!(
+                "Mover grupo: {dx:.0} {dy:.0} pt (solte para aplicar)"
+            ));
+        }
         DragState::Highlight { start } => {
             let (x, y, width, height) = rect_from_points(start, current);
             set_rubber_band(Some([x, y, x + width, y + height]));
@@ -2115,7 +2260,19 @@ unsafe extern "C" fn on_motion(
             mode,
             start,
             selection,
+            mut gate,
         } => {
+            let dragging = event_coords(event).is_some_and(|position| gate.update(position));
+            STATE.with(|cell| {
+                if let Some(DragState::Transform { gate: stored, .. }) =
+                    cell.borrow_mut().as_mut().and_then(|app| app.drag.as_mut())
+                {
+                    *stored = gate;
+                }
+            });
+            if !dragging {
+                return 0;
+            }
             if mode == TransformMode::Rotate {
                 set_cursor("grabbing");
             }
@@ -2137,6 +2294,10 @@ unsafe extern "C" fn on_button_release(
     if shell::hand_release() {
         return 1;
     }
+    // Clique duplo num combo/lista: a lista abre agora, com o botão solto.
+    if preencher::open_pending(event) {
+        return 1;
+    }
     let mut button = 0u32;
     if gdk_event_get_button(event, &mut button) == 0 || button != 1 {
         return 0;
@@ -2148,6 +2309,38 @@ unsafe extern "C" fn on_button_release(
     let result = (|| -> AppResult<()> {
         let end = preview_point(widget, event, true)?;
         match drag {
+            DragState::Marquee {
+                start,
+                mode,
+                mut gate,
+            } => {
+                if event_coords(event).is_some_and(|position| gate.update(position))
+                    && selecao_multipla::marquee_active()
+                {
+                    selecao_multipla::update_marquee(regras_selecao::rect_between(start, end));
+                    selecao_multipla::finish_marquee();
+                } else {
+                    selecao_multipla::cancel_marquee();
+                    if mode != SelectionMode::Replace {
+                        selecao_multipla::toggle_at(start, mode)?;
+                    } else {
+                        status("Nenhum elemento aqui. Ative uma ferramenta para inserir.");
+                    }
+                }
+                Ok(())
+            }
+            DragState::MoveGroup { start, mut gate } => {
+                if !event_coords(event).is_some_and(|position| gate.update(position)) {
+                    selecao_multipla::set_preview(IDENTITY);
+                    return Ok(());
+                }
+                let transform = textmove::translation(end.0 - start.0, end.1 - start.1);
+                if let Err(error) = selecao_multipla::transform_group(&transform) {
+                    selecao_multipla::set_preview(IDENTITY);
+                    return Err(error);
+                }
+                Ok(())
+            }
             DragState::Highlight { start } => {
                 let (x, y, width, height) = rect_from_points(start, end);
                 if width <= 0.5 || height <= 0.5 {
@@ -2162,7 +2355,12 @@ unsafe extern "C" fn on_button_release(
                 mode,
                 start,
                 selection,
+                mut gate,
             } => {
+                // Soltar sem passar do limiar é só um clique: nada muda.
+                if !event_coords(event).is_some_and(|position| gate.update(position)) {
+                    return Ok(());
+                }
                 let (transform, _) =
                     drag_transform(mode, &selection, start, end, shift_pressed(event));
                 if is_identity(&transform) {

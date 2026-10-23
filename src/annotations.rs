@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Escrita de anotações PDF pela API C de qpdf, chamada diretamente de Rust.
-use crate::infra::qpdf::{ffi::*, path_c, Document};
+use crate::infra::qpdf::{dict_keys, ffi::*, path_c, Document};
 use crate::AppResult;
 use std::ffi::{c_int, CStr, CString};
 use std::path::Path;
@@ -207,19 +207,8 @@ fn set_text_appearance(
     doc.set(widget, c"/DA", unsafe {
         qpdf_oh_new_string(doc.0, c"/RustPDFHelv 12 Tf 0 g".as_ptr())
     });
-    let appearance = unsafe { qpdf_oh_new_stream(doc.0) };
-    let ap_dict = unsafe { qpdf_oh_get_dict(doc.0, appearance) };
-    doc.set(ap_dict, c"/Type", doc.name(c"/XObject"));
-    doc.set(ap_dict, c"/Subtype", doc.name(c"/Form"));
-    doc.set(ap_dict, c"/Resources", resources);
     let width = rect[2] - rect[0];
     let height = rect[3] - rect[1];
-    let bbox = unsafe { qpdf_oh_new_array(doc.0) };
-    for coordinate in [0.0, 0.0, width, height] {
-        let number = unsafe { qpdf_oh_new_real_from_double(doc.0, coordinate, 3) };
-        unsafe { qpdf_oh_append_item(doc.0, bbox, number) };
-    }
-    doc.set(ap_dict, c"/BBox", bbox);
     let text = value.to_string_lossy();
     let mut content = format!(
         "q 0 0 {width:.3} {height:.3} re W n 1 1 1 rg 0 0 {width:.3} {height:.3} re f 0 0 0 RG 0.8 w 0.4 0.4 {:.3} {:.3} re S BT /RustPDFHelv 12 Tf 0 g",
@@ -242,6 +231,29 @@ fn set_text_appearance(
         content.extend_from_slice(b") Tj");
     }
     content.extend_from_slice(b" ET Q\n");
+    install_appearance(doc, widget, resources, width, height, &content)
+}
+
+/// Grava `content` como aparência normal (`/AP /N`) do widget.
+fn install_appearance(
+    doc: &Document,
+    widget: u32,
+    resources: u32,
+    width: f64,
+    height: f64,
+    content: &[u8],
+) -> AppResult<()> {
+    let appearance = unsafe { qpdf_oh_new_stream(doc.0) };
+    let ap_dict = unsafe { qpdf_oh_get_dict(doc.0, appearance) };
+    doc.set(ap_dict, c"/Type", doc.name(c"/XObject"));
+    doc.set(ap_dict, c"/Subtype", doc.name(c"/Form"));
+    doc.set(ap_dict, c"/Resources", resources);
+    let bbox = unsafe { qpdf_oh_new_array(doc.0) };
+    for coordinate in [0.0, 0.0, width, height] {
+        let number = unsafe { qpdf_oh_new_real_from_double(doc.0, coordinate, 3) };
+        unsafe { qpdf_oh_append_item(doc.0, bbox, number) };
+    }
+    doc.set(ap_dict, c"/BBox", bbox);
     let null = unsafe { qpdf_oh_new_null(doc.0) };
     unsafe {
         qpdf_oh_replace_stream_data(
@@ -258,6 +270,60 @@ fn set_text_appearance(
     doc.set(ap, c"/N", appearance);
     doc.set(widget, c"/AP", ap);
     doc.check(0)
+}
+
+/// Texto em WinAnsi (a fonte do formulário é Helvetica); o que não existe
+/// nela vira "?".
+fn win_ansi_lossy(text: &str) -> Vec<u8> {
+    text.chars()
+        .map(|character| {
+            crate::dominio::fonte::FontCodec::WinAnsi
+                .encode(character.encode_utf8(&mut [0; 4]))
+                .map_or(b'?', |bytes| bytes[0])
+        })
+        .collect()
+}
+
+/// Bit 18 de `/Ff` num campo `/Ch`: lista suspensa (combo).
+const FLAG_COMBO: i64 = 1 << 17;
+
+/// Aparência de um campo de escolha: combo mostra o valor como um campo de
+/// texto; lista aberta mostra todas as opções com a escolhida destacada
+/// (e grava `/I` com o índice dela).
+fn set_choice_appearance(
+    doc: &Document,
+    widget: u32,
+    resources: u32,
+    rect: [f64; 4],
+    value: &CStr,
+    options: &[String],
+    combo: bool,
+) -> AppResult<()> {
+    doc.set(widget, c"/V", unsafe {
+        qpdf_oh_new_unicode_string(doc.0, value.as_ptr())
+    });
+    doc.set(widget, c"/DA", unsafe {
+        qpdf_oh_new_string(doc.0, c"/RustPDFHelv 12 Tf 0 g".as_ptr())
+    });
+    let text = value.to_string_lossy();
+    let (width, height) = (rect[2] - rect[0], rect[3] - rect[1]);
+    if combo {
+        let content =
+            crate::dominio::formularios::combo_appearance(width, height, &win_ansi_lossy(&text));
+        return install_appearance(doc, widget, resources, width, height, &content);
+    }
+    let selected = options.iter().position(|option| *option == text);
+    let indices = unsafe { qpdf_oh_new_array(doc.0) };
+    if let Some(index) = selected {
+        unsafe { qpdf_oh_append_item(doc.0, indices, qpdf_oh_new_integer(doc.0, index as i64)) };
+    }
+    doc.set(widget, c"/I", indices);
+    let rows: Vec<Vec<u8>> = options
+        .iter()
+        .map(|option| win_ansi_lossy(option))
+        .collect();
+    let content = crate::dominio::formularios::list_appearance(width, height, &rows, selected);
+    install_appearance(doc, widget, resources, width, height, &content)
 }
 
 pub fn add_text_field(
@@ -413,21 +479,7 @@ fn checkbox_appearance(doc: &Document, width: f64, height: f64, checked: bool) -
         unsafe { qpdf_oh_append_item(doc.0, bbox, number) };
     }
     doc.set(dictionary, c"/BBox", bbox);
-    let mut content = format!(
-        "q 1 1 1 rg 0 0 {width:.3} {height:.3} re f 0 0 0 RG 1 w 0.5 0.5 {:.3} {:.3} re S\n",
-        width - 1.0,
-        height - 1.0
-    );
-    if checked {
-        content.push_str(&format!(
-            "2 w 3 {:.3} m {:.3} 3 l {:.3} {:.3} l S\n",
-            height * 0.5,
-            width * 0.4,
-            width - 3.0,
-            height - 3.0
-        ));
-    }
-    content.push_str("Q\n");
+    let content = crate::dominio::formularios::checkbox_appearance(width, height, checked);
     let null = unsafe { qpdf_oh_new_null(doc.0) };
     unsafe {
         qpdf_oh_replace_stream_data(doc.0, stream, content.as_ptr(), content.len(), null, null)
@@ -579,6 +631,41 @@ pub fn set_checkbox_value(input: &Path, output: &Path, name: &str, checked: bool
     doc.check(unsafe { qpdf_write(doc.0) })
 }
 
+/// Círculo como caminho fechado de quatro curvas de Bézier (k ≈ 0,5523).
+fn circle_path(cx: f64, cy: f64, radius: f64) -> String {
+    let k = radius * 0.552_284_749_831;
+    let (r, n) = (radius, |value: f64| format!("{value:.3}"));
+    format!(
+        "{} {} m {} {} {} {} {} {} c {} {} {} {} {} {} c {} {} {} {} {} {} c {} {} {} {} {} {} c h",
+        n(cx),
+        n(cy + r),
+        n(cx + k),
+        n(cy + r),
+        n(cx + r),
+        n(cy + k),
+        n(cx + r),
+        n(cy),
+        n(cx + r),
+        n(cy - k),
+        n(cx + k),
+        n(cy - r),
+        n(cx),
+        n(cy - r),
+        n(cx - k),
+        n(cy - r),
+        n(cx - r),
+        n(cy - k),
+        n(cx - r),
+        n(cy),
+        n(cx - r),
+        n(cy + k),
+        n(cx - k),
+        n(cy + r),
+        n(cx),
+        n(cy + r),
+    )
+}
+
 fn radio_appearance(doc: &Document, width: f64, height: f64, selected: bool) -> AppResult<u32> {
     let stream = unsafe { qpdf_oh_new_stream(doc.0) };
     let dictionary = unsafe { qpdf_oh_get_dict(doc.0, stream) };
@@ -591,48 +678,16 @@ fn radio_appearance(doc: &Document, width: f64, height: f64, selected: bool) -> 
     }
     doc.set(dictionary, c"/BBox", bbox);
     let radius = (width.min(height) / 2.0) - 1.0;
-    let cx = width / 2.0;
-    let cy = height / 2.0;
-    // Aproximação de círculo com quatro curvas de Bézier (k ≈ 0.5523).
-    let k = radius * 0.552_284_749_831;
+    let (cx, cy) = (width / 2.0, height / 2.0);
     let mut content = format!(
-        "q 1 1 1 rg 0 0 {width:.3} {height:.3} re f 0 0 0 RG 1 w \
-         {:.3} {:.3} m {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} c \
-         {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} c \
-         {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} c \
-         {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} c S\n",
-        cx,
-        cy + radius,
-        cx + k,
-        cy + radius,
-        cx + radius,
-        cy + k,
-        cx + radius,
-        cy,
-        cx + radius,
-        cy - k,
-        cx + k,
-        cy - radius,
-        cx,
-        cy - radius,
-        cx - k,
-        cy - radius,
-        cx - radius,
-        cy - k,
-        cx - radius,
-        cy,
-        cx - radius,
-        cy + k,
-        cx - k,
-        cy + radius,
-        cx,
-        cy + radius,
+        "q 1 1 1 rg 0 0 {width:.3} {height:.3} re f 0 0 0 RG 1 w {} S\n",
+        circle_path(cx, cy, radius)
     );
     if selected {
-        let inner = radius * 0.45;
+        // Bolinha preenchida (PDF não tem operador de arco).
         content.push_str(&format!(
-            "0 0 0 rg {:.3} {:.3} {:.3} 0 360 arc f\n",
-            cx, cy, inner
+            "0 0 0 rg {} f\n",
+            circle_path(cx, cy, radius * 0.45)
         ));
     }
     content.push_str("Q\n");
@@ -642,6 +697,28 @@ fn radio_appearance(doc: &Document, width: f64, height: f64, selected: bool) -> 
     };
     doc.check(0)?;
     Ok(stream)
+}
+
+/// Bandeiras `/Ff` de campos de botão (PDF 32000, tabela 226).
+const FLAG_NO_TOGGLE_TO_OFF: i64 = 1 << 14;
+const FLAG_RADIO: i64 = 1 << 15;
+const FLAG_PUSHBUTTON: i64 = 1 << 16;
+/// Valor gravado por versões anteriores do RustPDF nos grupos de rádio.
+const LEGACY_RADIO_FLAGS: i64 = 3;
+
+/// Bandeiras `/Ff` do campo; ausentes valem 0 (ler número de um nulo faz o
+/// qpdf imprimir aviso).
+fn field_flags(doc: &Document, field: u32) -> i64 {
+    let flags = unsafe { qpdf_oh_get_key(doc.0, field, c"/Ff".as_ptr()) };
+    if unsafe { qpdf_oh_is_number(doc.0, flags) } == 0 {
+        return 0;
+    }
+    unsafe { qpdf_oh_get_numeric_value(doc.0, flags) as i64 }
+}
+
+/// O campo de botão é um grupo de rádio (inclui os gravados com `/Ff 3`).
+fn is_radio(flags: i64, has_kids: bool) -> bool {
+    flags & FLAG_RADIO != 0 || (flags == LEGACY_RADIO_FLAGS && has_kids)
 }
 
 fn radio_export_name(label: &str) -> CString {
@@ -729,6 +806,19 @@ pub fn add_radio_group(
             return Err("Retângulo de rádio inválido".into());
         }
     }
+    // Opções com o mesmo nome de estado acenderiam juntas.
+    let mut exported: Vec<CString> = options
+        .iter()
+        .map(|(label, _)| radio_export_name(label))
+        .collect();
+    exported.sort();
+    if exported.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(
+            "Duas opções do rádio ficam com o mesmo nome (só letras e dígitos sem acento \
+             distinguem as opções)"
+                .into(),
+        );
+    }
     let input = crate::path_to_cstring(input)?;
     let output = crate::path_to_cstring(output)?;
     let name = CString::new(name).map_err(|_| "Nome de campo inválido")?;
@@ -743,8 +833,9 @@ pub fn add_radio_group(
 
     let parent = unsafe { qpdf_oh_new_dictionary(doc.0) };
     doc.set(parent, c"/FT", doc.name(c"/Btn"));
-    // NoToggleToOff | Radio
-    doc.set(parent, c"/Ff", unsafe { qpdf_oh_new_integer(doc.0, 3) });
+    doc.set(parent, c"/Ff", unsafe {
+        qpdf_oh_new_integer(doc.0, FLAG_RADIO | FLAG_NO_TOGGLE_TO_OFF)
+    });
     doc.set(parent, c"/T", unsafe {
         qpdf_oh_new_unicode_string(doc.0, name.as_ptr())
     });
@@ -752,6 +843,19 @@ pub fn add_radio_group(
     doc.set(parent, c"/P", page);
     let kids = unsafe { qpdf_oh_new_array(doc.0) };
     doc.set(parent, c"/Kids", kids);
+    // Rótulos de verdade (com acentos) de cada opção, na ordem dos widgets.
+    let labels = unsafe { qpdf_oh_new_array(doc.0) };
+    for (label, _) in options {
+        let label = CString::new(label.as_str()).map_err(|_| "Opção de rádio inválida")?;
+        unsafe {
+            qpdf_oh_append_item(
+                doc.0,
+                labels,
+                qpdf_oh_new_unicode_string(doc.0, label.as_ptr()),
+            )
+        };
+    }
+    doc.set(parent, c"/Opt", labels);
     let parent_indirect = unsafe { qpdf_make_indirect_object(doc.0, parent) };
 
     let mut states = Vec::new();
@@ -807,13 +911,27 @@ pub fn add_radio_group(
 }
 
 pub fn set_radio_value(input: &Path, output: &Path, name: &str, selection: &str) -> AppResult<()> {
+    if selection.contains('\0') {
+        return Err("Seleção inválida".into());
+    }
+    set_radio(input, output, name, radio_export_name(selection))
+}
+
+/// Marca a opção do rádio pelo nome do estado (`OptPix`, com ou sem barra),
+/// como lido em [`field_of_annotation`].
+pub fn set_radio_state(input: &Path, output: &Path, name: &str, state: &str) -> AppResult<()> {
+    let state = CString::new(format!("/{}", state.trim_start_matches('/')))
+        .map_err(|_| "Estado de rádio inválido")?;
+    set_radio(input, output, name, state)
+}
+
+fn set_radio(input: &Path, output: &Path, name: &str, wanted: CString) -> AppResult<()> {
     if name.trim().is_empty() {
         return Err("Nome de campo inválido".into());
     }
     let input = crate::path_to_cstring(input)?;
     let output = crate::path_to_cstring(output)?;
     let name = CString::new(name).map_err(|_| "Nome de campo inválido")?;
-    let selection = CString::new(selection).map_err(|_| "Seleção inválida")?;
     let doc = Document::new()?;
     doc.check(unsafe { qpdf_read(doc.0, input.as_ptr(), std::ptr::null()) })?;
     let (_form, fields) = acroform_fields(&doc, false)?;
@@ -823,16 +941,15 @@ pub fn set_radio_value(input: &Path, output: &Path, name: &str, selection: &str)
     if unsafe { qpdf_oh_is_name_and_equals(doc.0, field_type, c"/Btn".as_ptr()) } == 0 {
         return Err("O campo encontrado não é um botão".into());
     }
-    let flags = unsafe { qpdf_oh_get_key(doc.0, field, c"/Ff".as_ptr()) };
-    let flags = unsafe { qpdf_oh_get_numeric_value(doc.0, flags) } as i64;
-    if flags & 2 == 0 {
+    let flags = field_flags(&doc, field);
+    let kids = unsafe { qpdf_oh_get_key(doc.0, field, c"/Kids".as_ptr()) };
+    let has_kids = unsafe { qpdf_oh_is_array(doc.0, kids) } != 0;
+    if !is_radio(flags, has_kids) {
         return Err("O campo encontrado não é um grupo de rádio".into());
     }
-    let kids = unsafe { qpdf_oh_get_key(doc.0, field, c"/Kids".as_ptr()) };
-    if unsafe { qpdf_oh_is_array(doc.0, kids) } == 0 {
+    if !has_kids {
         return Err("O rádio não possui widgets em /Kids".into());
     }
-    let wanted = radio_export_name(&selection.to_string_lossy());
     let wanted_name = unsafe { qpdf_oh_new_name(doc.0, wanted.as_ptr()) };
     let count = unsafe { qpdf_oh_get_array_n_items(doc.0, kids) };
     let mut found = false;
@@ -925,10 +1042,16 @@ pub fn add_choice_field(
     let opt = unsafe { qpdf_oh_new_array(doc.0) };
     for option in options {
         let option = CString::new(option.as_str()).map_err(|_| "Opção inválida")?;
-        unsafe { qpdf_oh_append_item(doc.0, opt, qpdf_oh_new_string(doc.0, option.as_ptr())) };
+        unsafe {
+            qpdf_oh_append_item(
+                doc.0,
+                opt,
+                qpdf_oh_new_unicode_string(doc.0, option.as_ptr()),
+            )
+        };
     }
     doc.set(widget, c"/Opt", opt);
-    set_text_appearance(&doc, widget, resources, rect, &value)?;
+    set_choice_appearance(&doc, widget, resources, rect, &value, options, combo)?;
     let indirect = unsafe { qpdf_make_indirect_object(doc.0, widget) };
     unsafe { qpdf_oh_append_item(doc.0, fields, indirect) };
     append_widget_to_page(&doc, page, indirect);
@@ -966,24 +1089,35 @@ pub fn set_choice_value(input: &Path, output: &Path, name: &str, value: &str) ->
         *coordinate = unsafe { qpdf_oh_get_numeric_value(doc.0, item) };
     }
     let opt = unsafe { qpdf_oh_get_key(doc.0, field, c"/Opt".as_ptr()) };
+    let mut options = Vec::new();
     if unsafe { qpdf_oh_is_array(doc.0, opt) } != 0 {
         let count = unsafe { qpdf_oh_get_array_n_items(doc.0, opt) };
-        let mut allowed = false;
         for index in 0..count {
             let item = unsafe { qpdf_oh_get_array_item(doc.0, opt, index) };
+            // Opção pode ser `[exportado mostrado]`: vale o mostrado.
+            let item = if unsafe { qpdf_oh_is_array(doc.0, item) } != 0 {
+                unsafe { qpdf_oh_get_array_item(doc.0, item, 1) }
+            } else {
+                item
+            };
             let pointer = unsafe { qpdf_oh_get_utf8_value(doc.0, item) };
-            if !pointer.is_null() && unsafe { CStr::from_ptr(pointer) } == value.as_c_str() {
-                allowed = true;
-                break;
+            if !pointer.is_null() {
+                options.push(
+                    unsafe { CStr::from_ptr(pointer) }
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
         }
-        if !value.to_string_lossy().is_empty() && !allowed {
+        let text = value.to_string_lossy();
+        if !text.is_empty() && !options.iter().any(|option| *option == text) {
             return Err("O valor precisa estar entre as opções do campo".into());
         }
     }
     let form = unsafe { qpdf_oh_get_key(doc.0, qpdf_get_root(doc.0), c"/AcroForm".as_ptr()) };
     let resources = ensure_form_font(&doc, form);
-    set_text_appearance(&doc, field, resources, rect, &value)?;
+    let combo = field_flags(&doc, field) & FLAG_COMBO != 0;
+    set_choice_appearance(&doc, field, resources, rect, &value, &options, combo)?;
     doc.check(0)?;
     doc.check(unsafe { qpdf_init_write(doc.0, output.as_ptr()) })?;
     doc.check(unsafe { qpdf_write(doc.0) })
@@ -1018,8 +1152,7 @@ pub fn list_form_fields(input: &Path) -> AppResult<Vec<(String, String, String)>
             .to_string_lossy()
             .into_owned();
         let field_type = unsafe { qpdf_oh_get_key(doc.0, field, c"/FT".as_ptr()) };
-        let flags = unsafe { qpdf_oh_get_key(doc.0, field, c"/Ff".as_ptr()) };
-        let flags = unsafe { qpdf_oh_get_numeric_value(doc.0, flags) } as i64;
+        let flags = field_flags(&doc, field);
         let kind = if unsafe { qpdf_oh_is_name_and_equals(doc.0, field_type, c"/Tx".as_ptr()) } != 0
         {
             if flags & 4096 != 0 {
@@ -1028,9 +1161,10 @@ pub fn list_form_fields(input: &Path) -> AppResult<Vec<(String, String, String)>
                 "texto"
             }
         } else if unsafe { qpdf_oh_is_name_and_equals(doc.0, field_type, c"/Btn".as_ptr()) } != 0 {
-            if flags & 2 != 0 {
+            let kids = unsafe { qpdf_oh_get_key(doc.0, field, c"/Kids".as_ptr()) };
+            if is_radio(flags, unsafe { qpdf_oh_is_array(doc.0, kids) } != 0) {
                 "rádio"
-            } else if flags & 4 != 0 {
+            } else if flags & FLAG_PUSHBUTTON != 0 {
                 "botão"
             } else {
                 "seleção"
@@ -1111,6 +1245,203 @@ fn write_rect(doc: &Document, object: u32, rect: [f64; 4]) {
 }
 
 /// Lista anotações e widgets de formulário com retângulos.
+/// Tipo de campo de formulário, para preencher pela interface.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldKind {
+    Text,
+    Checkbox,
+    Radio,
+    Combo,
+    List,
+    Other,
+}
+
+/// Campo de formulário de um widget da página.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldInfo {
+    pub name: String,
+    pub kind: FieldKind,
+    /// Valor atual (`/V`): texto, opção escolhida ou estado (`Yes`, `OptPix`, `Off`).
+    pub value: String,
+    /// Opções mostradas: de combo/lista e, num rádio, o rótulo de cada
+    /// opção (na ordem de `states`).
+    pub options: Vec<String>,
+    /// Estado "ligado" deste widget (caixa ou opção de rádio), sem a barra.
+    pub on_state: Option<String>,
+    /// Estados "ligado" de cada widget do campo (rádio: um por opção).
+    pub states: Vec<String>,
+}
+
+fn utf8_of(doc: &Document, object: u32) -> Option<String> {
+    let pointer = unsafe { qpdf_oh_get_utf8_value(doc.0, object) };
+    (!pointer.is_null()).then(|| {
+        unsafe { CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+fn name_of(doc: &Document, object: u32) -> Option<String> {
+    if unsafe { qpdf_oh_is_name(doc.0, object) } == 0 {
+        return None;
+    }
+    let pointer = unsafe { qpdf_oh_get_name(doc.0, object) };
+    (!pointer.is_null()).then(|| {
+        unsafe { CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string()
+    })
+}
+
+/// Estado "ligado" de um widget: a chave de `/AP /N` que não é `/Off`.
+fn on_state_of(doc: &Document, widget: u32) -> Option<String> {
+    let normal = unsafe {
+        qpdf_oh_get_key(
+            doc.0,
+            qpdf_oh_get_key(doc.0, widget, c"/AP".as_ptr()),
+            c"/N".as_ptr(),
+        )
+    };
+    if unsafe { qpdf_oh_is_dictionary(doc.0, normal) } == 0 {
+        return None;
+    }
+    dict_keys(doc, normal)
+        .into_iter()
+        .map(|key| key.trim_start_matches('/').to_string())
+        .find(|key| key != "Off")
+}
+
+/// Textos de um array `/Opt` (de `[exportado mostrado]`, o mostrado).
+fn opt_texts(doc: &Document, field: u32) -> Vec<String> {
+    let opt = unsafe { qpdf_oh_get_key(doc.0, field, c"/Opt".as_ptr()) };
+    if unsafe { qpdf_oh_is_array(doc.0, opt) } == 0 {
+        return Vec::new();
+    }
+    (0..unsafe { qpdf_oh_get_array_n_items(doc.0, opt) })
+        .filter_map(|index| {
+            let item = unsafe { qpdf_oh_get_array_item(doc.0, opt, index) };
+            let shown = if unsafe { qpdf_oh_is_array(doc.0, item) } != 0 {
+                unsafe { qpdf_oh_get_array_item(doc.0, item, 1) }
+            } else {
+                item
+            };
+            utf8_of(doc, shown)
+        })
+        .collect()
+}
+
+/// Lê o campo `field`; `widget` é o widget clicado (para `on_state`).
+fn read_field(doc: &Document, field: u32, widget: Option<u32>) -> Option<FieldInfo> {
+    let name = utf8_of(doc, unsafe {
+        qpdf_oh_get_key(doc.0, field, c"/T".as_ptr())
+    })?;
+    let field_type = unsafe { qpdf_oh_get_key(doc.0, field, c"/FT".as_ptr()) };
+    let is =
+        |kind: &CStr| unsafe { qpdf_oh_is_name_and_equals(doc.0, field_type, kind.as_ptr()) } != 0;
+    let flags = field_flags(doc, field);
+    let kids = unsafe { qpdf_oh_get_key(doc.0, field, c"/Kids".as_ptr()) };
+    let has_kids = unsafe { qpdf_oh_is_array(doc.0, kids) } != 0;
+    let kind = if is(c"/Tx") {
+        FieldKind::Text
+    } else if is(c"/Btn") && is_radio(flags, has_kids) {
+        FieldKind::Radio
+    } else if is(c"/Btn") && flags & FLAG_PUSHBUTTON == 0 {
+        FieldKind::Checkbox
+    } else if is(c"/Ch") && flags & FLAG_COMBO != 0 {
+        FieldKind::Combo
+    } else if is(c"/Ch") {
+        FieldKind::List
+    } else {
+        FieldKind::Other
+    };
+    let value_object = unsafe { qpdf_oh_get_key(doc.0, field, c"/V".as_ptr()) };
+    let value = name_of(doc, value_object)
+        .or_else(|| utf8_of(doc, value_object))
+        .unwrap_or_default();
+    let states: Vec<String> = if has_kids {
+        (0..unsafe { qpdf_oh_get_array_n_items(doc.0, kids) })
+            .filter_map(|index| {
+                on_state_of(doc, unsafe { qpdf_oh_get_array_item(doc.0, kids, index) })
+            })
+            .collect()
+    } else {
+        on_state_of(doc, field).into_iter().collect()
+    };
+    let mut options = opt_texts(doc, field);
+    if kind == FieldKind::Radio && options.len() != states.len() {
+        // Rádio sem /Opt (ou de outro programa): o próprio nome do estado.
+        options = states
+            .iter()
+            .map(|state| state.strip_prefix("Opt").unwrap_or(state).to_string())
+            .collect();
+    }
+    Some(FieldInfo {
+        name,
+        kind,
+        value,
+        options,
+        on_state: widget.and_then(|widget| on_state_of(doc, widget)),
+        states,
+    })
+}
+
+/// Campo do widget `index` em `/Annots` da página (o próprio widget ou o
+/// pai, nos grupos de rádio); `None` se não for widget de formulário.
+pub fn field_of_annotation(
+    input: &Path,
+    page_number: usize,
+    index: usize,
+) -> AppResult<Option<FieldInfo>> {
+    if page_number == 0 {
+        return Err("Número de página inválido".into());
+    }
+    let input = path_c(input)?;
+    let doc = Document::new()?;
+    doc.check(unsafe { qpdf_read(doc.0, input.as_ptr(), std::ptr::null()) })?;
+    let page = unsafe { qpdf_get_page_n(doc.0, page_number - 1) };
+    let annots = unsafe { qpdf_oh_get_key(doc.0, page, c"/Annots".as_ptr()) };
+    if unsafe { qpdf_oh_is_array(doc.0, annots) } == 0
+        || index >= unsafe { qpdf_oh_get_array_n_items(doc.0, annots) } as usize
+    {
+        return Ok(None);
+    }
+    let widget = unsafe { qpdf_oh_get_array_item(doc.0, annots, index as c_int) };
+    let subtype = unsafe { qpdf_oh_get_key(doc.0, widget, c"/Subtype".as_ptr()) };
+    if unsafe { qpdf_oh_is_name_and_equals(doc.0, subtype, c"/Widget".as_ptr()) } == 0 {
+        return Ok(None);
+    }
+    // O widget sem /T pertence ao campo pai (rádio: um widget por opção).
+    let own_name = unsafe { qpdf_oh_get_key(doc.0, widget, c"/T".as_ptr()) };
+    let field = if unsafe { qpdf_oh_is_string(doc.0, own_name) } != 0 {
+        widget
+    } else {
+        unsafe { qpdf_oh_get_key(doc.0, widget, c"/Parent".as_ptr()) }
+    };
+    Ok(read_field(&doc, field, Some(widget)))
+}
+
+/// Campos de primeiro nível do formulário (em `/AcroForm /Fields`).
+pub fn form_fields(input: &Path) -> AppResult<Vec<FieldInfo>> {
+    let input = path_c(input)?;
+    let doc = Document::new()?;
+    doc.check(unsafe { qpdf_read(doc.0, input.as_ptr(), std::ptr::null()) })?;
+    let form = unsafe { qpdf_oh_get_key(doc.0, qpdf_get_root(doc.0), c"/AcroForm".as_ptr()) };
+    let fields = unsafe { qpdf_oh_get_key(doc.0, form, c"/Fields".as_ptr()) };
+    if unsafe { qpdf_oh_is_array(doc.0, fields) } == 0 {
+        return Ok(Vec::new());
+    }
+    Ok((0..unsafe { qpdf_oh_get_array_n_items(doc.0, fields) })
+        .filter_map(|index| {
+            read_field(
+                &doc,
+                unsafe { qpdf_oh_get_array_item(doc.0, fields, index) },
+                None,
+            )
+        })
+        .collect())
+}
+
 pub fn list_annotations(input: &Path, page_number: usize) -> AppResult<Vec<AnnotationInfo>> {
     let _trace = crate::trace(|| "  qpdf lista anotações".into());
     if page_number == 0 {
