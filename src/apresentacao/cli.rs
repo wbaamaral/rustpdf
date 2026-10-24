@@ -2,7 +2,7 @@
 //! Argumentos da CLI → comandos, sem executar nada.
 use std::path::PathBuf;
 
-pub const EXPORT_USAGE: &str = "Uso: rustpdf-cli export ENTRADA.pdf SAIDA.{md,docx,pptx,csv,xlsx} [--paginas 1-3,7] [--para-ia] [--sem-imagens] [--quebrar-paginas] [--fiel] [--ocr IDIOMA] [--separador ;] [--sem-bom]";
+pub const EXPORT_USAGE: &str = "Uso: rustpdf-cli export ENTRADA.pdf SAIDA.{md,docx,pptx,odt,odg,csv,xlsx} [--paginas 1-3,7] [--para-ia] [--sem-imagens] [--quebrar-paginas] [--fiel] [--ocr IDIOMA] [--separador ;] [--sem-bom]";
 
 pub use crate::app::exportar::{ExportFormat, ExportRequest};
 

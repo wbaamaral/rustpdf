@@ -26,6 +26,11 @@ pub fn action_format(action: usize) -> Option<ExportFormat> {
         .and_then(|index| MENU.get(index).copied())
 }
 
+/// Intervalo de identificadores de ação do menu Exportar › Documento como…
+pub fn export_actions() -> std::ops::Range<usize> {
+    FIRST_ACTION..FIRST_ACTION + MENU.len()
+}
+
 /// Pergunta sim/não da opção principal do formato, se houver.
 pub fn question(format: ExportFormat) -> Option<&'static str> {
     match format {
@@ -120,6 +125,17 @@ mod tests {
             ]
         );
         assert_eq!(FIRST_ACTION + 2, 72);
+    }
+
+    #[test]
+    fn export_actions_covers_all_menu_items_and_excludes_cancel() {
+        for (index, &format) in MENU.iter().enumerate() {
+            let action = FIRST_ACTION + index;
+            assert!(export_actions().contains(&action));
+            assert_eq!(action_format(action), Some(format));
+        }
+        assert!(!export_actions().contains(&CANCEL_ACTION));
+        assert_eq!(action_format(CANCEL_ACTION), None);
     }
 
     #[test]

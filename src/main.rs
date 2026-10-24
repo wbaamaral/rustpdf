@@ -866,7 +866,7 @@ fn dispatch(action: usize) -> AppResult<()> {
                 status("Nenhuma exportação em andamento");
             }
         }
-        action @ 70..=74 => {
+        action if exportacao::export_actions().contains(&action) => {
             let Some(format) = exportacao::action_format(action) else {
                 return Ok(());
             };
@@ -2460,5 +2460,27 @@ mod tests {
                 PathBuf::from(format!("/tmp/saida.{}", format.extension()))
             );
         }
+    }
+
+    #[test]
+    fn export_menu_actions_cover_all_formats_and_match_dispatch_range() {
+        for format in ExportFormat::ALL {
+            assert!(
+                exportacao::MENU.contains(&format),
+                "formato {format:?} ausente de exportacao::MENU"
+            );
+        }
+        for (index, &format) in exportacao::MENU.iter().enumerate() {
+            let action = exportacao::FIRST_ACTION + index;
+            assert!(
+                exportacao::export_actions().contains(&action),
+                "ação {action} ({format:?}) fora de export_actions()"
+            );
+            assert_eq!(exportacao::action_format(action), Some(format));
+        }
+        assert_eq!(
+            exportacao::export_actions(),
+            exportacao::FIRST_ACTION..exportacao::CANCEL_ACTION
+        );
     }
 }
