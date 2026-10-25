@@ -75,7 +75,7 @@ jobs:
         run: cargo test --release --offline
       - name: Pacotes
         run: packaging/package.sh linux --skip-tests --formats tar,deb
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-ubuntu
           path: |
@@ -102,7 +102,7 @@ jobs:
         run: |
           chown -R builder: "$GITHUB_WORKSPACE"
           su builder -c "cd '$GITHUB_WORKSPACE' && packaging/package.sh linux --formats arch"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-arch
           path: |
@@ -129,7 +129,7 @@ jobs:
         run: cargo test --release --offline
       - name: Pacote
         run: packaging/package.sh linux --skip-tests --formats rpm
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-fedora
           path: dist/packages/*.rpm
@@ -169,7 +169,7 @@ jobs:
         run: cargo test --release --offline
       - name: Pacotes
         run: packaging/package.sh windows --skip-tests
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: |
@@ -188,7 +188,7 @@ jobs:
           ref: ${{ env.REF }}
           fetch-depth: 0
           lfs: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Arquivos e somas SHA-256
