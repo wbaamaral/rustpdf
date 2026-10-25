@@ -22,7 +22,8 @@ cp -a @STAGE@/. %{buildroot}/
 /usr/bin/rustpdf
 /usr/bin/rustpdf-cli
 /usr/share/applications/rustpdf.desktop
-/usr/share/icons/hicolor/scalable/apps/rustpdf.svg
+/usr/share/icons/hicolor/*/apps/rustpdf.*
+/usr/share/pixmaps/rustpdf.png
 %doc /usr/share/doc/rustpdf/README.md
 %doc /usr/share/doc/rustpdf/TERCEIROS.md
 %license /usr/share/licenses/rustpdf/LICENSE

@@ -43,6 +43,12 @@ fn contract(ocr: &impl OcrEngine, image: &Path) {
     );
     assert!(ocr.text(image, Some("eng")).unwrap().contains("testa"));
     assert!(ocr.words(b"isto nao e um PNG", "eng").is_err());
+    let languages = ocr.languages().unwrap();
+    assert!(languages.iter().any(|name| name == "eng"), "{languages:?}");
+    assert!(
+        languages.iter().all(|name| !name.contains(' ')),
+        "{languages:?}"
+    );
 }
 
 #[test]

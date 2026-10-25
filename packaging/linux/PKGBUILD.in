@@ -32,6 +32,12 @@ package() {
     install -Dm755 target/release/rustpdf-cli "$pkgdir/usr/bin/rustpdf-cli"
     install -Dm644 packaging/linux/rustpdf.desktop "$pkgdir/usr/share/applications/rustpdf.desktop"
     install -Dm644 packaging/rustpdf.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/rustpdf.svg"
+    local size
+    for size in 16 22 24 32 48 64 128 256; do
+        install -Dm644 "packaging/icons/rustpdf-$size.png" \
+            "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/rustpdf.png"
+    done
+    install -Dm644 packaging/icons/rustpdf-128.png "$pkgdir/usr/share/pixmaps/rustpdf.png"
     install -Dm644 README.md "$pkgdir/usr/share/doc/rustpdf/README.md"
     install -Dm644 TERCEIROS.md "$pkgdir/usr/share/doc/rustpdf/TERCEIROS.md"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/rustpdf/LICENSE"

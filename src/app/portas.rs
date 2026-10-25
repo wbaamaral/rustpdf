@@ -57,6 +57,10 @@ pub trait OcrEngine {
     /// Palavras reconhecidas no PNG com caixas em **pixels** da imagem
     /// (origem no topo); `width`/`height` da página são as dimensões dela.
     fn words(&self, png: &[u8], language: &str) -> Result<Page, ToolError>;
+
+    /// Idiomas instalados (`por`, `eng`…); lista vazia = não foi possível
+    /// saber, e o motor decide ao reconhecer.
+    fn languages(&self) -> Result<Vec<String>, ToolError>;
 }
 
 /// Onde as imagens estão desenhadas numa página.

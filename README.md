@@ -29,8 +29,9 @@
 - Inserção de notas adesivas e destaques de texto por coordenadas ou por seleção com o mouse.
 
 ### 🔍 OCR Pesquisável Integrado
-- Reconhecimento de texto via Tesseract em páginas digitalizadas.
-- O modo **OCR Pesquisável** adiciona uma camada de texto invisível sobre o documento original, tornando-o indexável e selecionável sem alterar os pixels renderizados.
+- Reconhecimento de texto via Tesseract em páginas digitalizadas: página atual, intervalo (`1-3,7`) ou documento inteiro.
+- O modo **OCR Pesquisável** adiciona uma camada de texto invisível sobre o documento original, tornando-o indexável e selecionável sem alterar os pixels renderizados. Páginas que já têm texto são puladas; o resultado é uma única edição (um Desfazer remove tudo).
+- Roda em segundo plano com barra de progresso e botão **Cancelar** (ou Esc); a janela fica bloqueada até terminar.
 
 ### 📤 Exportação Estruturada Multiformato
 Exportação nativa a partir da interface gráfica ou via CLI:
@@ -171,6 +172,17 @@ rustpdf-cli export doc.pdf documento.md --para-ia                  # Otimizado p
 # Opções de intervalo de páginas e OCR para documentos escaneados
 rustpdf-cli export doc.pdf parcial.docx --paginas 1-3,7
 rustpdf-cli export escaneado.pdf texto.md --ocr por
+```
+
+### OCR
+```bash
+# Texto reconhecido (páginas separadas por form feed; andamento na saída de erro)
+rustpdf-cli ocr escaneado.pdf todas por
+rustpdf-cli ocr escaneado.pdf 1-3,7
+
+# Camada pesquisável no documento inteiro (padrão: por+eng; pula páginas com texto)
+rustpdf-cli ocr-searchable escaneado.pdf pesquisavel.pdf todas
+rustpdf-cli ocr-searchable escaneado.pdf pesquisavel.pdf 2 eng --refazer
 ```
 
 ### Documentos Protegidos com Senha

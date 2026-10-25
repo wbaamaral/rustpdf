@@ -77,7 +77,15 @@ pub const CANCEL_ACTION: usize = FIRST_ACTION + MENU.len();
 /// Barra de status durante a exportação (`done` páginas já lidas).
 pub fn progress_message(format: ExportFormat, done: usize, total: usize) -> String {
     format!(
-        "Exportando para {}… página {} de {total} (Exportar › Cancelar exportação para parar)",
+        "{} (Exportar › Cancelar exportação para parar)",
+        cli_progress_message(format, done, total)
+    )
+}
+
+/// Andamento da exportação na CLI.
+pub fn cli_progress_message(format: ExportFormat, done: usize, total: usize) -> String {
+    format!(
+        "Exportando para {}… página {} de {total}",
         format.label(),
         done + 1
     )
@@ -196,6 +204,10 @@ mod tests {
         assert_eq!(
             progress_message(ExportFormat::Docx, 1, 5),
             "Exportando para Word… página 2 de 5 (Exportar › Cancelar exportação para parar)"
+        );
+        assert_eq!(
+            cli_progress_message(ExportFormat::Csv, 0, 1),
+            "Exportando para CSV… página 1 de 1"
         );
         assert_eq!(CANCEL_ACTION, FIRST_ACTION + MENU.len());
         assert_eq!(action_format(CANCEL_ACTION), None);

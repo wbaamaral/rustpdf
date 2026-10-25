@@ -8,7 +8,9 @@ else prefix=$HOME/.local
 fi
 rm -f "$prefix/bin/rustpdf" "$prefix/bin/rustpdf-cli" \
       "$prefix/share/applications/rustpdf.desktop" \
-      "$prefix/share/icons/hicolor/scalable/apps/rustpdf.svg"
+      "$prefix"/share/icons/hicolor/*/apps/rustpdf.svg \
+      "$prefix"/share/icons/hicolor/*/apps/rustpdf.png \
+      "$prefix/share/pixmaps/rustpdf.png"
 rm -rf "$prefix/share/doc/rustpdf" "$prefix/share/licenses/rustpdf"
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$prefix/share/applications" 2>/dev/null || true
 command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t "$prefix/share/icons/hicolor" 2>/dev/null || true

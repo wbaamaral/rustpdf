@@ -4,7 +4,15 @@ use std::path::PathBuf;
 
 pub const EXPORT_USAGE: &str = "Uso: rustpdf-cli export ENTRADA.pdf SAIDA.{md,docx,pptx,odt,odg,csv,xlsx} [--paginas 1-3,7] [--para-ia] [--sem-imagens] [--quebrar-paginas] [--fiel] [--ocr IDIOMA] [--separador ;] [--sem-bom]";
 
+pub const OCR_USAGE: &str = "Uso: rustpdf-cli ocr ENTRADA.pdf PAGINAS [IDIOMA]";
+
+pub const OCR_SEARCHABLE_USAGE: &str =
+    "Uso: rustpdf-cli ocr-searchable ENTRADA.pdf SAIDA.pdf PAGINAS [IDIOMA] [--refazer]";
+
+const INVALID_LANGUAGE: &str = "Idioma do Tesseract inválido (ex.: por, eng, por+eng)";
+
 pub use crate::app::exportar::{ExportFormat, ExportRequest};
+use crate::dominio::ocr::valid_language;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportCommand {
@@ -76,11 +84,7 @@ pub fn parse_export(args: &[String]) -> Result<ExportCommand, String> {
             "--ocr" => {
                 let invalid = "--ocr precisa do idioma do Tesseract (ex.: por, eng, por+eng)";
                 let language = options.next().ok_or(invalid)?;
-                let valid = !language.is_empty()
-                    && language
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '_' | '-'));
-                if !valid {
+                if !valid_language(language) {
                     return Err(invalid.into());
                 }
                 command.ocr = Some(language.clone());
@@ -98,6 +102,72 @@ pub fn parse_export(args: &[String]) -> Result<ExportCommand, String> {
     Ok(ExportCommand {
         input: input.into(),
         request: command,
+    })
+}
+
+/// `ocr ENTRADA PAGINAS [IDIOMA]`: texto reconhecido das páginas.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcrCommand {
+    pub input: PathBuf,
+    /// `3`, `1-3,7` ou `todas` (validado contra o documento ao abrir).
+    pub pages: String,
+    /// `None` = idioma padrão do Tesseract.
+    pub language: Option<String>,
+}
+
+/// `ocr-searchable ENTRADA SAIDA PAGINAS [IDIOMA] [--refazer]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcrSearchableCommand {
+    pub input: PathBuf,
+    pub output: PathBuf,
+    pub pages: String,
+    pub language: String,
+    /// Reconhecer também as páginas que já têm texto.
+    pub redo: bool,
+}
+
+fn language_argument(value: Option<&String>) -> Result<Option<String>, String> {
+    match value {
+        Some(language) if !valid_language(language) => Err(INVALID_LANGUAGE.into()),
+        other => Ok(other.cloned()),
+    }
+}
+
+/// O que vem depois de `ocr`.
+pub fn parse_ocr(args: &[String]) -> Result<OcrCommand, String> {
+    let [input, pages, rest @ ..] = args else {
+        return Err(OCR_USAGE.into());
+    };
+    if rest.len() > 1 || rest.iter().any(|value| value.starts_with("--")) {
+        return Err(OCR_USAGE.into());
+    }
+    Ok(OcrCommand {
+        input: input.into(),
+        pages: pages.clone(),
+        language: language_argument(rest.first())?,
+    })
+}
+
+/// O que vem depois de `ocr-searchable`.
+pub fn parse_ocr_searchable(args: &[String]) -> Result<OcrSearchableCommand, String> {
+    let redo = args.iter().any(|value| value == "--refazer");
+    let positional: Vec<&String> = args.iter().filter(|value| *value != "--refazer").collect();
+    if let Some(option) = positional.iter().find(|value| value.starts_with("--")) {
+        return Err(format!("Opção desconhecida: {option}"));
+    }
+    let [input, output, pages, rest @ ..] = positional.as_slice() else {
+        return Err(OCR_SEARCHABLE_USAGE.into());
+    };
+    if rest.len() > 1 {
+        return Err(OCR_SEARCHABLE_USAGE.into());
+    }
+    Ok(OcrSearchableCommand {
+        input: (*input).into(),
+        output: (*output).into(),
+        pages: (*pages).clone(),
+        language: language_argument(rest.first().copied())?
+            .unwrap_or_else(|| crate::apresentacao::ocr::DEFAULT_LANGUAGE.into()),
+        redo,
     })
 }
 
@@ -222,6 +292,66 @@ mod tests {
         assert_eq!(
             parse_export(&args(&["a.pdf", "b.docx", "--fiel"])).unwrap_err(),
             "--fiel só vale para .pptx e .odg"
+        );
+    }
+
+    #[test]
+    fn ocr_reads_pages_and_an_optional_language() {
+        assert_eq!(
+            parse_ocr(&args(&["a.pdf", "todas"])).unwrap(),
+            OcrCommand {
+                input: "a.pdf".into(),
+                pages: "todas".into(),
+                language: None
+            }
+        );
+        let command = parse_ocr(&args(&["a.pdf", "1-3,7", "por+eng"])).unwrap();
+        assert_eq!(command.language.as_deref(), Some("por+eng"));
+        assert_eq!(parse_ocr(&args(&["a.pdf"])).unwrap_err(), OCR_USAGE);
+        assert_eq!(
+            parse_ocr(&args(&["a.pdf", "1", "por", "eng"])).unwrap_err(),
+            OCR_USAGE
+        );
+        assert_eq!(
+            parse_ocr(&args(&["a.pdf", "1", "--refazer"])).unwrap_err(),
+            OCR_USAGE
+        );
+        assert_eq!(
+            parse_ocr(&args(&["a.pdf", "1", "p;rm"])).unwrap_err(),
+            INVALID_LANGUAGE
+        );
+    }
+
+    #[test]
+    fn ocr_searchable_defaults_to_portuguese_and_english() {
+        assert_eq!(
+            parse_ocr_searchable(&args(&["a.pdf", "b.pdf", "2"])).unwrap(),
+            OcrSearchableCommand {
+                input: "a.pdf".into(),
+                output: "b.pdf".into(),
+                pages: "2".into(),
+                language: "por+eng".into(),
+                redo: false
+            }
+        );
+        let command =
+            parse_ocr_searchable(&args(&["a.pdf", "b.pdf", "todas", "--refazer", "eng"])).unwrap();
+        assert_eq!((command.language.as_str(), command.redo), ("eng", true));
+        assert_eq!(
+            parse_ocr_searchable(&args(&["a.pdf", "b.pdf"])).unwrap_err(),
+            OCR_SEARCHABLE_USAGE
+        );
+        assert_eq!(
+            parse_ocr_searchable(&args(&["a.pdf", "b.pdf", "1", "eng", "x"])).unwrap_err(),
+            OCR_SEARCHABLE_USAGE
+        );
+        assert_eq!(
+            parse_ocr_searchable(&args(&["a.pdf", "b.pdf", "1", "--forcar"])).unwrap_err(),
+            "Opção desconhecida: --forcar"
+        );
+        assert_eq!(
+            parse_ocr_searchable(&args(&["a.pdf", "b.pdf", "1", "por+"])).unwrap_err(),
+            INVALID_LANGUAGE
         );
     }
 

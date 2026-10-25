@@ -795,11 +795,150 @@ fn export_reads_scanned_pages_with_ocr() {
         !success && stderr.contains("OCR"),
         "sem texto: orienta o OCR ({stderr})"
     );
-    ok(&["export", &scanned, &output, "--sem-imagens", "--ocr", "eng"]);
+    let (success, _, stderr) = cli(&["export", &scanned, &output, "--sem-imagens", "--ocr", "eng"]);
+    assert!(success, "{stderr}");
+    assert!(
+        stderr.contains("página 1 de 1"),
+        "andamento no stderr: {stderr}"
+    );
     let text = fs::read_to_string(&output).unwrap();
     // O OCR pode errar letras de nomes em maiúsculas (o Tesseract do Ubuntu
     // 24.04 lê "RUSTPDE"); palavras comuns saem estáveis.
     assert!(text.contains("testa") && text.contains("aqui"), "{text}");
+}
+
+/// Documento de 3 páginas: 1 e 3 digitalizadas (só imagem do texto), 2 com
+/// texto digital.
+fn mixed_document(root: &Path) -> String {
+    let original = path(root, "original.pdf");
+    let mut pdf = PdfBuilder::new();
+    pdf.text_page(&[
+        (72.0, 700.0, 40.0, "Primeira testa"),
+        (72.0, 600.0, 40.0, "OCR aqui"),
+    ]);
+    pdf.text_page(&[
+        (72.0, 700.0, 40.0, "Ultima testa"),
+        (72.0, 600.0, 40.0, "fim aqui"),
+    ]);
+    pdf.write(Path::new(&original));
+    let mut scans = Vec::new();
+    for page in ["1", "2"] {
+        let image = root.join(format!("pagina-{page}.png"));
+        ok(&["png", &original, &image.to_string_lossy(), page]);
+        let png = fs::read(&image).unwrap();
+        scans.push(rustpdf::infra::png::decode(&png, 50_000_000).unwrap());
+    }
+    let mixed = path(root, "misto.pdf");
+    let mut pdf = PdfBuilder::new();
+    let font = pdf.helvetica();
+    let scanned_page = |pdf: &mut PdfBuilder, (width, height, rgb): &(usize, usize, Vec<u8>)| {
+        let image = pdf.image_rgb(*width, *height, rgb);
+        pdf.page(
+            595.0,
+            842.0,
+            &format!("/XObject << /Im {image} >>"),
+            "q 595 0 0 842 0 0 cm /Im Do Q",
+        );
+    };
+    scanned_page(&mut pdf, &scans[0]);
+    pdf.page(
+        595.0,
+        842.0,
+        &format!("/Font << /F1 {font} >>"),
+        "BT /F1 24 Tf 1 0 0 1 72 700 Tm (Texto digital) Tj ET",
+    );
+    scanned_page(&mut pdf, &scans[1]);
+    pdf.write(Path::new(&mixed));
+    mixed
+}
+
+#[test]
+fn ocr_reads_every_page_with_progress_on_stderr() {
+    let dir = workspace("ocr-texto");
+    let mixed = mixed_document(dir.path());
+    let (success, stdout, stderr) = cli(&["ocr", &mixed, "todas", "eng"]);
+    assert!(success, "{stderr}");
+    let pages: Vec<&str> = stdout.split('\x0c').collect();
+    assert_eq!(
+        pages.len(),
+        3,
+        "páginas separadas por form feed: {stdout:?}"
+    );
+    assert!(
+        pages[0].contains("testa") && pages[0].contains("aqui"),
+        "{stdout}"
+    );
+    assert!(pages[2].contains("fim"), "{stdout}");
+    for line in ["OCR: página 1 de 3", "OCR: página 3 de 3"] {
+        assert!(
+            stderr.contains(line),
+            "andamento fora do terminal: {stderr}"
+        );
+    }
+    assert!(!stdout.contains("OCR: página"), "stdout só com o resultado");
+    // Uma página só, como antes, e um intervalo.
+    assert!(ok(&["ocr", &mixed, "1"]).contains("testa"));
+    let two = ok(&["ocr", &mixed, "2-3", "eng"]);
+    assert_eq!(two.split('\x0c').count(), 2);
+    let (success, _, stderr) = cli(&["ocr", &mixed, "4"]);
+    assert!(
+        !success && stderr.contains("Página fora de 1..=3"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn ocr_searchable_covers_the_document_and_skips_pages_with_text() {
+    let dir = workspace("ocr-pesquisavel");
+    let root = dir.path();
+    let mixed = mixed_document(root);
+    let output = path(root, "pesquisavel.pdf");
+    let (success, stdout, stderr) = cli(&["ocr-searchable", &mixed, &output, "todas", "eng"]);
+    assert!(success, "{stderr}");
+    assert!(
+        stdout.starts_with("OCR pesquisável: ")
+            && stdout.contains(" em 2 páginas; 1 página já tinha texto"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("OCR: página 2 de 3"), "{stderr}");
+    assert!(ok(&["text", &output, "1"]).contains("testa"));
+    assert!(ok(&["text", &output, "3"]).contains("fim"));
+    assert_eq!(
+        ok(&["text", &output, "2"]).trim(),
+        "Texto digital",
+        "sem camada duplicada"
+    );
+    let check = Command::new("qpdf")
+        .arg("--check")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+
+    // De novo: tudo já tem texto, nada muda; --refazer força.
+    let again = path(root, "de-novo.pdf");
+    let stdout = ok(&["ocr-searchable", &output, &again, "todas", "eng"]);
+    assert!(
+        stdout.contains("nenhuma página reconhecida; 3 páginas já tinham texto"),
+        "{stdout}"
+    );
+    let stdout = ok(&["ocr-searchable", &mixed, &again, "2", "eng", "--refazer"]);
+    assert!(stdout.contains(" em 1 página"), "{stdout}");
+
+    let (success, _, stderr) = cli(&["ocr-searchable", &mixed, &again, "1", "xyz"]);
+    assert!(
+        !success && stderr.contains("Idioma OCR não instalado: xyz"),
+        "{stderr}"
+    );
+    let (success, _, stderr) = cli(&["ocr-searchable", &mixed, &again]);
+    assert!(
+        !success && stderr.contains("Uso: rustpdf-cli ocr-searchable"),
+        "{stderr}"
+    );
 }
 
 #[test]

@@ -7,11 +7,18 @@
 use super::*;
 use rustpdf::apresentacao::exportacao::{ExportFormat, ExportRequest};
 use rustpdf::infra::tarefa::Job;
+use rustpdf::PageRange;
 use std::fs;
 
 #[link(name = "gtk-3")]
 extern "C" {
     fn gtk_toolbar_new() -> *mut c_void;
+    fn gtk_progress_bar_new() -> *mut c_void;
+    fn gtk_progress_bar_set_fraction(bar: *mut c_void, fraction: f64);
+    fn gtk_progress_bar_set_text(bar: *mut c_void, text: *const c_char);
+    fn gtk_progress_bar_set_show_text(bar: *mut c_void, show: c_int);
+    fn gtk_button_new_with_mnemonic(label: *const c_char) -> *mut c_void;
+    fn gtk_widget_set_no_show_all(widget: *mut c_void, no_show_all: c_int);
     fn gtk_toolbar_insert(toolbar: *mut c_void, item: *mut c_void, position: c_int);
     fn gtk_toolbar_set_style(toolbar: *mut c_void, style: c_int);
     fn gtk_toolbar_set_icon_size(toolbar: *mut c_void, size: c_int);
@@ -178,6 +185,11 @@ pub struct Widgets {
     pub thumbs_box: *mut c_void,
     pub comments_box: *mut c_void,
     pub statusbar: *mut c_void,
+    /// Barra de progresso e botão Cancelar do OCR (ocultos sem OCR).
+    pub progress: *mut c_void,
+    pub progress_cancel: *mut c_void,
+    /// Desativados enquanto o OCR roda: menu, barras e área do documento.
+    pub busy_widgets: Vec<*mut c_void>,
     pub welcome: *mut c_void,
     pub zoom: f64,
     pub zoom_mode: ZoomMode,
@@ -558,6 +570,9 @@ pub unsafe fn build() -> AppState {
             thumbs_box: ptr::null_mut(),
             comments_box: ptr::null_mut(),
             statusbar: ptr::null_mut(),
+            progress: ptr::null_mut(),
+            progress_cancel: ptr::null_mut(),
+            busy_widgets: Vec::new(),
             welcome: ptr::null_mut(),
             zoom: 1.0,
             zoom_mode: ZoomMode::FitWidth,
@@ -654,7 +669,29 @@ pub unsafe fn build() -> AppState {
     gtk_label_set_xalign(status_label, 0.0);
     gtk_widget_set_hexpand(status_label, 1);
     let info = gtk_label_new(ptr::null());
+    let progress = gtk_progress_bar_new();
+    gtk_progress_bar_set_show_text(progress, 1);
+    gtk_widget_set_size_request(progress, 260, -1);
+    gtk_widget_set_valign(progress, 3);
+    let progress_cancel = gtk_button_new_with_mnemonic(c"_Cancelar".as_ptr());
+    gtk_widget_set_tooltip_markup(
+        progress_cancel,
+        c"<b>Cancelar OCR</b>\nPara na próxima página, sem alterar o documento (Esc)".as_ptr(),
+    );
+    g_signal_connect_data(
+        progress_cancel,
+        c"clicked".as_ptr(),
+        on_cancel_ocr as *const c_void,
+        ptr::null_mut(),
+        ptr::null_mut(),
+        0,
+    );
+    for widget in [progress, progress_cancel] {
+        gtk_widget_set_no_show_all(widget, 1);
+    }
     gtk_box_pack_start(statusbar, status_label, 1, 1, 0);
+    gtk_box_pack_start(statusbar, progress, 0, 0, 0);
+    gtk_box_pack_start(statusbar, progress_cancel, 0, 0, 0);
     gtk_box_pack_start(statusbar, info, 0, 0, 0);
 
     gtk_box_pack_start(root, menubar, 0, 0, 0);
@@ -692,6 +729,9 @@ pub unsafe fn build() -> AppState {
     b.ui.info = info;
     b.ui.sidebar = sidebar;
     b.ui.statusbar = statusbar;
+    b.ui.progress = progress;
+    b.ui.progress_cancel = progress_cancel;
+    b.ui.busy_widgets = vec![menubar, bar_file, bar_tools, body];
     b.ui.welcome = welcome;
     AppState {
         window,
@@ -1678,6 +1718,12 @@ unsafe extern "C" fn on_key_press(
     if !focus.is_null() && g_type_check_instance_is_a(focus, gtk_editable_get_type()) != 0 {
         return 0;
     }
+    if ocr_running() {
+        if key == KEY_ESCAPE && cancel_ocr() {
+            status("Cancelando o OCR…");
+        }
+        return 1;
+    }
     match key {
         KEY_DELETE | KEY_KP_DELETE
             if current_selection().is_some() || crate::selecao_multipla::active() =>
@@ -2122,6 +2168,190 @@ unsafe extern "C" fn poll_export(_data: *mut c_void) -> c_int {
         progress.finished
     });
     c_int::from(!finished)
+}
+
+/// O que a tarefa de OCR produz.
+pub enum OcrKind {
+    /// Camada pesquisável, aplicada ao documento ao terminar.
+    Searchable { language: String },
+    /// Texto reconhecido, mostrado numa janela de leitura.
+    Text { language: Option<String> },
+}
+
+/// Mensagens da tarefa de OCR para a interface.
+enum OcrEvent {
+    /// Página `feitas` de `total` começando.
+    Page(usize, usize),
+    Searchable(Result<Vec<rustpdf::PageOcr>, String>),
+    Text(Result<Vec<String>, String>),
+}
+
+/// Tarefa de OCR: a cópia lida, o documento e a revisão de onde ela saiu
+/// e as páginas pedidas.
+struct OcrTask {
+    job: Job<OcrEvent>,
+    snapshot: PathBuf,
+    work: PathBuf,
+    revision: u64,
+    pages: PageRange,
+}
+
+thread_local! {
+    static OCR_TASK: RefCell<Option<OcrTask>> = const { RefCell::new(None) };
+}
+
+pub fn ocr_running() -> bool {
+    OCR_TASK.with(|cell| cell.borrow().is_some())
+}
+
+/// Pede para o OCR em andamento parar (na próxima página).
+pub fn cancel_ocr() -> bool {
+    OCR_TASK.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|task| task.job.cancel())
+            .is_some()
+    })
+}
+
+unsafe extern "C" fn on_cancel_ocr(_button: *mut c_void, _data: *mut c_void) {
+    if cancel_ocr() {
+        status("Cancelando o OCR…");
+    }
+}
+
+/// Mostra ou oculta a barra de progresso e bloqueia (ou libera) a janela.
+fn set_ocr_busy(busy: bool) {
+    let Some((progress, cancel, widgets)) =
+        with_widgets(|ui| (ui.progress, ui.progress_cancel, ui.busy_widgets.clone()))
+    else {
+        return;
+    };
+    unsafe {
+        for widget in widgets {
+            gtk_widget_set_sensitive(widget, c_int::from(!busy));
+        }
+        if busy {
+            gtk_progress_bar_set_fraction(progress, 0.0);
+            gtk_progress_bar_set_text(progress, c"OCR: preparando…".as_ptr());
+        }
+        gtk_widget_set_visible(progress, c_int::from(busy));
+        gtk_widget_set_visible(cancel, c_int::from(busy));
+    }
+}
+
+fn show_ocr_progress(done: usize, total: usize) {
+    let Some(progress) = with_widgets(|ui| ui.progress) else {
+        return;
+    };
+    let text = cstring(&rustpdf::apresentacao::ocr::progress_message(done, total));
+    unsafe {
+        gtk_progress_bar_set_fraction(progress, rustpdf::apresentacao::ocr::fraction(done, total));
+        gtk_progress_bar_set_text(progress, text.as_ptr());
+    }
+}
+
+/// OCR das `pages` de `snapshot` (cópia do documento `work` na revisão
+/// `revision`) numa thread; a janela fica bloqueada até terminar.
+pub fn start_ocr(snapshot: PathBuf, work: PathBuf, revision: u64, pages: PageRange, kind: OcrKind) {
+    let source = snapshot.clone();
+    let range = pages.clone();
+    let job = Job::spawn(move |worker| {
+        // Cancelar (ou fechar a janela) faz o próximo envio falhar e para o OCR.
+        let progress = |done: usize, total: usize| worker.send(OcrEvent::Page(done, total));
+        let sources = PdfSession::ocr_sources();
+        let event = match kind {
+            OcrKind::Searchable { language } => OcrEvent::Searchable(
+                rustpdf::app::ocr::recognize(
+                    &sources, &source, &range, &language, false, &progress,
+                )
+                .map_err(String::from),
+            ),
+            OcrKind::Text { language } => OcrEvent::Text(
+                rustpdf::app::ocr::read_text(
+                    &sources,
+                    &source,
+                    &range,
+                    language.as_deref(),
+                    &progress,
+                )
+                .map_err(String::from),
+            ),
+        };
+        worker.send(event);
+    });
+    OCR_TASK.with(|cell| {
+        *cell.borrow_mut() = Some(OcrTask {
+            job,
+            snapshot,
+            work,
+            revision,
+            pages,
+        })
+    });
+    set_ocr_busy(true);
+    unsafe { g_timeout_add(150, poll_ocr, ptr::null_mut()) };
+}
+
+/// Aplica a camada reconhecida se o documento ainda é o mesmo, na mesma revisão.
+fn apply_ocr(work: &Path, revision: u64, results: &[rustpdf::PageOcr]) -> AppResult<String> {
+    let summary = with_session(|session| {
+        if session.work_path() != work || session.revision() != revision {
+            return Err("O documento mudou durante o OCR; o resultado foi descartado".into());
+        }
+        session.apply_ocr_layer(results)
+    })?;
+    if summary.recognized > 0 {
+        render()?;
+    }
+    Ok(rustpdf::apresentacao::ocr::summary_message(&summary))
+}
+
+unsafe extern "C" fn poll_ocr(_data: *mut c_void) -> c_int {
+    let Some((progress, finished, cancelled)) = OCR_TASK.with(|cell| {
+        cell.borrow().as_ref().map(|task| {
+            let progress = task.job.poll();
+            let finished = progress.finished;
+            (progress.items, finished, task.job.cancelled())
+        })
+    }) else {
+        return 0;
+    };
+    let mut outcome = None;
+    for event in progress {
+        match event {
+            OcrEvent::Page(done, total) => show_ocr_progress(done, total),
+            other => outcome = Some(other),
+        }
+    }
+    if !finished {
+        return 1;
+    }
+    let Some(task) = OCR_TASK.with(|cell| cell.borrow_mut().take()) else {
+        return 0;
+    };
+    let _ = fs::remove_file(&task.snapshot);
+    set_ocr_busy(false);
+    // A sessão é usada abaixo (aplicar, redesenhar): a tarefa já saiu do estado.
+    let message = match outcome {
+        Some(OcrEvent::Searchable(Ok(results))) => {
+            apply_ocr(&task.work, task.revision, &results).unwrap_or_else(|error| error)
+        }
+        Some(OcrEvent::Text(Ok(texts))) => {
+            show_text(
+                "OCR",
+                &rustpdf::apresentacao::ocr::text_report(&task.pages, &texts),
+            );
+            rustpdf::apresentacao::ocr::text_done_message(texts.len())
+        }
+        Some(OcrEvent::Searchable(Err(error)) | OcrEvent::Text(Err(error))) => error,
+        Some(OcrEvent::Page(..)) | None if cancelled => {
+            "OCR cancelado; o documento não mudou".into()
+        }
+        Some(OcrEvent::Page(..)) | None => "OCR interrompido".into(),
+    };
+    status(&message);
+    0
 }
 
 /// Troca as imagens das miniaturas que ficaram prontas (thread principal).

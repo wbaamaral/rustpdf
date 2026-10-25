@@ -361,6 +361,10 @@ impl OcrEngine for FakeOcr {
             blocks,
         })
     }
+
+    fn languages(&self) -> Result<Vec<String>, ToolError> {
+        Ok(vec!["eng".into(), "por".into()])
+    }
 }
 
 /// Dublê de [`ImageSource`]: caixas fixas por página. Validado contra o

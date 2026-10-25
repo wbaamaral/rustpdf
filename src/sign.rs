@@ -483,7 +483,7 @@ fn set_signature_appearance(
             continue;
         }
         content.extend_from_slice(format!(" 1 0 0 1 5 {y:.3} Tm (").as_bytes());
-        content.extend_from_slice(&crate::ocr::pdf_text(line));
+        content.extend_from_slice(&crate::dominio::ocr::pdf_text(line));
         content.extend_from_slice(b") Tj");
         y -= 11.0;
     }

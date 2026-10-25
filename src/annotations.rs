@@ -227,7 +227,7 @@ fn set_text_appearance(
     for (index, line) in lines.iter().enumerate() {
         let y = start_y - index as f64 * line_height;
         content.extend_from_slice(format!(" 1 0 0 1 4 {y:.3} Tm (").as_bytes());
-        content.extend_from_slice(&crate::ocr::pdf_text(line));
+        content.extend_from_slice(&crate::dominio::ocr::pdf_text(line));
         content.extend_from_slice(b") Tj");
     }
     content.extend_from_slice(b" ET Q\n");

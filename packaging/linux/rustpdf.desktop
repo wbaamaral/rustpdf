@@ -10,3 +10,4 @@ Categories=Office;Viewer;
 MimeType=application/pdf;
 Keywords=pdf;editor;anotação;formulário;ocr;
 StartupNotify=true
+StartupWMClass=Rustpdf

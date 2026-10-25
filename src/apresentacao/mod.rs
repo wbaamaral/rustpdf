@@ -10,4 +10,5 @@ pub mod exportacao;
 pub mod formularios;
 pub mod menu_contexto;
 pub mod miniaturas;
+pub mod ocr;
 pub mod selecao;

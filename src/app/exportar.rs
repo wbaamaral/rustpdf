@@ -2,6 +2,7 @@
 //! Caso de uso: extrair o documento estruturado das páginas escolhidas.
 
 use crate::app::erros::ToolError;
+use crate::app::ocr::{recognize_page, OcrSources};
 use crate::app::portas::{ImageSource, LayoutSource, OcrEngine, Renderer, RulingSource};
 use crate::dominio::exportacao::estrutura::structure_with;
 use crate::dominio::exportacao::modelo::{Document, PageContent, PageImage, TableRef};
@@ -159,9 +160,6 @@ impl From<ExportError> for String {
     }
 }
 
-/// Resolução das páginas enviadas ao OCR.
-const OCR_DPI: u32 = 300;
-
 /// Portas usadas pela exportação e opções de leitura das páginas.
 #[derive(Clone, Copy)]
 pub struct Sources<'a> {
@@ -311,15 +309,18 @@ fn page_layout(sources: &Sources, pdf: &Path, page: usize) -> Result<Page, Expor
     if layout.words().next().is_some() {
         return Ok(layout);
     }
-    let whole = LayoutRect::new(0.0, 0.0, layout.width, layout.height);
-    let png = sources.renderer.render_region(pdf, page, whole, OCR_DPI)?;
-    let mut recognized = engine.words(&png, language)?;
-    // Pixels → pontos pela largura real da imagem (arredondada pelo renderizador).
-    let factor = layout.width / recognized.width;
-    recognized = recognized.scaled(factor);
-    recognized.width = layout.width;
-    recognized.height = layout.height;
-    Ok(recognized)
+    let ocr = OcrSources {
+        layout: sources.layout,
+        renderer: sources.renderer,
+        engine,
+    };
+    Ok(recognize_page(
+        &ocr,
+        pdf,
+        page,
+        (layout.width, layout.height),
+        language,
+    )?)
 }
 
 /// Imagens da página renderizadas, com as caixas em origem no topo

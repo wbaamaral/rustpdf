@@ -37,6 +37,22 @@ impl OcrEngine for Tesseract {
             detail: "TSV sem a linha da página".into(),
         })
     }
+
+    fn languages(&self) -> Result<Vec<String>, ToolError> {
+        run("tesseract", &["--list-langs".into()]).map(|list| parse_languages(&list))
+    }
+}
+
+/// Saída de `tesseract --list-langs`: a primeira linha é o cabeçalho
+/// ("List of available languages…"), as demais, um idioma cada.
+pub fn parse_languages(list: &str) -> Vec<String> {
+    list.lines()
+        .skip_while(|line| !line.starts_with("List of"))
+        .skip(1)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 /// Grava o PNG numa pasta temporária privada só durante `work`.
@@ -159,6 +175,17 @@ mod tests {
         let page = parse_tsv(TSV).unwrap();
         let words: Vec<&str> = page.words().map(|word| word.text.as_str()).collect();
         assert_eq!(words, ["RUSTPDF", "testa", "OCR"]);
+    }
+
+    #[test]
+    fn lists_installed_languages_after_the_header() {
+        let list = "List of available languages in \"/usr/share/tessdata/\" (3):\neng\nosd\npor\n";
+        assert_eq!(parse_languages(list), ["eng", "osd", "por"]);
+        assert!(parse_languages("").is_empty());
+        assert!(
+            parse_languages("eng\npor").is_empty(),
+            "sem cabeçalho, sem lista"
+        );
     }
 
     #[test]

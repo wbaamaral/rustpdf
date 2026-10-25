@@ -741,8 +741,56 @@ fn has_unsaved() -> bool {
     })
 }
 
+/// OCR (texto ou camada pesquisável) das páginas escolhidas, em segundo
+/// plano sobre uma cópia, com barra de progresso.
+fn start_ocr_from_menu(searchable: bool) -> AppResult<()> {
+    let (total, current) = with_session(|s| Ok((s.pages, s.page)))?;
+    let kind = if searchable {
+        let Some(language) = prompt_text_default(
+            "OCR pesquisável: idiomas do Tesseract (ex.: por+eng):",
+            rustpdf::apresentacao::ocr::DEFAULT_LANGUAGE,
+        ) else {
+            return Ok(());
+        };
+        let language = language.trim().to_string();
+        rustpdf::app::ocr::check_language(&rustpdf::infra::tesseract::Tesseract, &language)?;
+        shell::OcrKind::Searchable { language }
+    } else {
+        shell::OcrKind::Text { language: None }
+    };
+    let (question, default) = if searchable {
+        (
+            "OCR pesquisável: páginas (vazio = todas; ex.: 1-3,7):",
+            String::new(),
+        )
+    } else {
+        (
+            "OCR: páginas a ler (vazio = todas; ex.: 1-3,7):",
+            current.to_string(),
+        )
+    };
+    let Some(pages) = prompt_text_default(question, &default) else {
+        return Ok(());
+    };
+    let pages = rustpdf::apresentacao::ocr::pages(&pages, total)?;
+    let (snapshot, work, revision) = with_session(|s| {
+        Ok((
+            s.export_snapshot()?,
+            s.work_path().to_path_buf(),
+            s.revision(),
+        ))
+    })?;
+    shell::start_ocr(snapshot, work, revision, pages, kind);
+    status("OCR em andamento…");
+    Ok(())
+}
+
 fn dispatch(action: usize) -> AppResult<()> {
     let _trace = rustpdf::trace(|| format!("ação {action}"));
+    // Durante o OCR a janela fica bloqueada; isto cobre atalhos que escapem.
+    if shell::ocr_running() {
+        return Err("Aguarde o OCR terminar (Esc ou Cancelar para parar)".into());
+    }
     // Zoom mantém a seleção (está em pontos da página); o resto a descarta.
     // Ações de imagem usam a imagem selecionada, guardada antes de limpar.
     let selected_image = current_selection()
@@ -876,10 +924,7 @@ fn dispatch(action: usize) -> AppResult<()> {
             let text = with_session(|s| s.extract_text())?;
             show_text("Texto da página", &text);
         }
-        14 => {
-            let text = with_session(|s| s.ocr_current())?;
-            show_text("OCR da página", &text);
-        }
+        14 => start_ocr_from_menu(false)?,
         15 => shell::activate_tool(ToolMode::Note),
         31 => {
             let Some(position) = prompt_text_default(
@@ -919,15 +964,7 @@ fn dispatch(action: usize) -> AppResult<()> {
             }
         }
         23 => shell::activate_tool(ToolMode::Image),
-        24 => {
-            if let Some(language) =
-                prompt_text("OCR pesquisável: idiomas instalados (ex.: por+eng):")
-            {
-                let words = with_session(|s| s.ocr_searchable_current(language.trim()))?;
-                render()?;
-                status(&format!("OCR pesquisável: {words} palavras reconhecidas"));
-            }
-        }
+        24 => start_ocr_from_menu(true)?,
         25 => shell::activate_tool(ToolMode::TextField),
         26 => preencher::fill_from_menu(preencher::Wanted::Text)?,
         27 => shell::activate_tool(ToolMode::Checkbox),

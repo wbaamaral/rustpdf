@@ -96,13 +96,28 @@ linux_build() {
     done
 }
 
+# Tamanhos dos ícones PNG pré-renderizados em packaging/icons (rustpdf-N.png).
+ICON_SIZES="16 22 24 32 48 64 128 256"
+
+# Ícone do aplicativo sob `share`: SVG, PNGs do hicolor por tamanho e cópia
+# em pixmaps (menus e docks que não leem SVG ou buscam um tamanho fixo).
+install_icons() {
+    local share=$1 size
+    install -Dm644 "$PACKAGING/rustpdf.svg" "$share/icons/hicolor/scalable/apps/rustpdf.svg"
+    for size in $ICON_SIZES; do
+        install -Dm644 "$PACKAGING/icons/rustpdf-$size.png" \
+            "$share/icons/hicolor/${size}x${size}/apps/rustpdf.png"
+    done
+    install -Dm644 "$PACKAGING/icons/rustpdf-128.png" "$share/pixmaps/rustpdf.png"
+}
+
 # Árvore /usr com os arquivos instalados (base de .rpm e .deb).
 linux_stage_usr() {
     local root=$1
     install -Dm755 "$ROOT/target/release/rustpdf" "$root/usr/bin/rustpdf"
     install -Dm755 "$ROOT/target/release/rustpdf-cli" "$root/usr/bin/rustpdf-cli"
     install -Dm644 "$PACKAGING/linux/rustpdf.desktop" "$root/usr/share/applications/rustpdf.desktop"
-    install -Dm644 "$PACKAGING/rustpdf.svg" "$root/usr/share/icons/hicolor/scalable/apps/rustpdf.svg"
+    install_icons "$root/usr/share"
     install -Dm644 "$ROOT/README.md" "$root/usr/share/doc/rustpdf/README.md"
     install -Dm644 "$ROOT/LICENSE" "$root/usr/share/licenses/rustpdf/LICENSE"
     install -Dm644 "$ROOT/TERCEIROS.md" "$root/usr/share/doc/rustpdf/TERCEIROS.md"
@@ -115,7 +130,7 @@ linux_tar() {
     install -Dm755 "$ROOT/target/release/rustpdf" "$stage/bin/rustpdf"
     install -Dm755 "$ROOT/target/release/rustpdf-cli" "$stage/bin/rustpdf-cli"
     install -Dm644 "$PACKAGING/linux/rustpdf.desktop" "$stage/share/applications/rustpdf.desktop"
-    install -Dm644 "$PACKAGING/rustpdf.svg" "$stage/share/icons/hicolor/scalable/apps/rustpdf.svg"
+    install_icons "$stage/share"
     install -Dm644 "$ROOT/README.md" "$stage/share/doc/rustpdf/README.md"
     install -Dm644 "$ROOT/LICENSE" "$stage/share/licenses/rustpdf/LICENSE"
     install -Dm644 "$ROOT/LICENSE" "$stage/LICENSE"

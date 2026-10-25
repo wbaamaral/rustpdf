@@ -13,7 +13,10 @@ fi
 install -Dm755 "$here/bin/rustpdf" "$prefix/bin/rustpdf"
 install -Dm755 "$here/bin/rustpdf-cli" "$prefix/bin/rustpdf-cli"
 install -Dm644 "$here/share/applications/rustpdf.desktop" "$prefix/share/applications/rustpdf.desktop"
-install -Dm644 "$here/share/icons/hicolor/scalable/apps/rustpdf.svg" "$prefix/share/icons/hicolor/scalable/apps/rustpdf.svg"
+for icon in "$here"/share/icons/hicolor/*/apps/rustpdf.*; do
+    install -Dm644 "$icon" "$prefix/share/icons/hicolor/${icon#"$here"/share/icons/hicolor/}"
+done
+install -Dm644 "$here/share/pixmaps/rustpdf.png" "$prefix/share/pixmaps/rustpdf.png"
 install -Dm644 "$here/share/licenses/rustpdf/LICENSE" "$prefix/share/licenses/rustpdf/LICENSE"
 for doc in "$here"/share/doc/rustpdf/*; do
     install -Dm644 "$doc" "$prefix/share/doc/rustpdf/$(basename "$doc")"

@@ -8,4 +8,5 @@ pub mod fonte;
 pub mod formularios;
 pub mod geometria;
 pub mod layout;
+pub mod ocr;
 pub mod paginas;

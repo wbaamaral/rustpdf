@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use rustpdf::apresentacao::cli::{parse_export, ExportFormat};
+use rustpdf::apresentacao::cli::{parse_export, parse_ocr, parse_ocr_searchable, ExportFormat};
+use rustpdf::apresentacao::exportacao::cli_progress_message;
+use rustpdf::apresentacao::ocr as ocr_texts;
 use rustpdf::infra::exportacao::export_to_files;
 use rustpdf::{
     create_blank_pdf, parse_checkbox_state, AppResult, ImageEditOutcome, Matrix, Occurrence,
     PageNumber, PdfSession, Selection, SelectionTarget,
 };
+use std::cell::Cell;
+use std::io::IsTerminal;
 use std::path::Path;
 
 fn usage() -> &'static str {
-    concat!("Uso: rustpdf-cli [--password-stdin] [--allow-unencrypted-output] COMANDO ...\n  rustpdf-cli info ENTRADA.pdf\n  rustpdf-cli new SAIDA.pdf\n  rustpdf-cli rotate ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli delete ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli append ENTRADA.pdf SAIDA.pdf OUTRO.pdf\n  rustpdf-cli blank-after ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli extract ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli png ENTRADA.pdf SAIDA.png PAGINA\n  rustpdf-cli text ENTRADA.pdf PAGINA\n  rustpdf-cli export ENTRADA.pdf SAIDA.{md,docx,pptx,odt,odg,csv,xlsx} [--paginas 1-3,7] [--para-ia] [--sem-imagens] [--quebrar-paginas] [--fiel] [--ocr IDIOMA] [--separador ;] [--sem-bom]\n  rustpdf-cli ocr ENTRADA.pdf PAGINA\n  rustpdf-cli ocr-searchable ENTRADA.pdf SAIDA.pdf PAGINA [IDIOMA]\n  rustpdf-cli fields ENTRADA.pdf\n  rustpdf-cli text-field ENTRADA.pdf SAIDA.pdf PAGINA NOME VALOR X Y LARGURA ALTURA [multiline]\n  rustpdf-cli set-field ENTRADA.pdf SAIDA.pdf NOME NOVO_VALOR\n  rustpdf-cli checkbox ENTRADA.pdf SAIDA.pdf PAGINA NOME SIM_OU_NAO X Y TAMANHO\n  rustpdf-cli set-checkbox ENTRADA.pdf SAIDA.pdf NOME SIM_OU_NAO\n  rustpdf-cli radio ENTRADA.pdf SAIDA.pdf PAGINA NOME SELECAO_OU_- \"op1,op2\" X Y TAMANHO ESPACO\n  rustpdf-cli set-radio ENTRADA.pdf SAIDA.pdf NOME SELECAO\n  rustpdf-cli choice ENTRADA.pdf SAIDA.pdf PAGINA NOME VALOR \"op1,op2\" X Y LARGURA ALTURA [combo|lista]\n  rustpdf-cli set-choice ENTRADA.pdf SAIDA.pdf NOME VALOR\n  rustpdf-cli text-runs ENTRADA.pdf PAGINA\n  rustpdf-cli replace-text ENTRADA.pdf SAIDA.pdf PAGINA ANTIGO NOVO\n  rustpdf-cli images ENTRADA.pdf PAGINA\n  rustpdf-cli image-draws ENTRADA.pdf PAGINA\n  rustpdf-cli replace-image ENTRADA.pdf SAIDA.pdf PAGINA NOME IMAGEM.png [N|todas]\n  rustpdf-cli replace-image-at ENTRADA.pdf SAIDA.pdf PAGINA X Y IMAGEM.png\n  rustpdf-cli move-image ENTRADA.pdf SAIDA.pdf PAGINA NOME DX DY [N|todas]\n  rustpdf-cli remove-image ENTRADA.pdf SAIDA.pdf PAGINA NOME [N|todas]\n  rustpdf-cli remove-image-at ENTRADA.pdf SAIDA.pdf PAGINA X Y\n  rustpdf-cli move-text ENTRADA.pdf SAIDA.pdf PAGINA X Y DX DY\n  rustpdf-cli edit-text-at ENTRADA.pdf SAIDA.pdf PAGINA X Y NOVO_TEXTO\n  rustpdf-cli select ENTRADA.pdf PAGINA X Y\n  rustpdf-cli move-object ENTRADA.pdf SAIDA.pdf PAGINA X Y DX DY\n  rustpdf-cli resize-object ENTRADA.pdf SAIDA.pdf PAGINA X Y FATOR_X FATOR_Y\n  rustpdf-cli rotate-object ENTRADA.pdf SAIDA.pdf PAGINA X Y GRAUS\n  rustpdf-cli transform-object ENTRADA.pdf SAIDA.pdf PAGINA X Y A B C D E F\n  rustpdf-cli note ENTRADA.pdf SAIDA.pdf PAGINA TEXTO\n  rustpdf-cli note-at ENTRADA.pdf SAIDA.pdf PAGINA TEXTO X Y\n  rustpdf-cli highlight-at ENTRADA.pdf SAIDA.pdf PAGINA X Y LARGURA ALTURA\n  rustpdf-cli insert-text ENTRADA.pdf SAIDA.pdf PAGINA TEXTO\n  rustpdf-cli insert-text-at ENTRADA.pdf SAIDA.pdf PAGINA TEXTO X Y TAMANHO_FONTE\n  rustpdf-cli insert-image ENTRADA.pdf SAIDA.pdf PAGINA IMAGEM.png\n  rustpdf-cli insert-image-at ENTRADA.pdf SAIDA.pdf PAGINA IMAGEM.png X Y LARGURA ALTURA\n  rustpdf-cli crop ENTRADA.pdf SAIDA.pdf PAGINA MARGEM_EM_PONTOS\n\nRustPDF ", env!("CARGO_PKG_VERSION"), " — Copyright (C) 2026 Welyqrson Bastos Amaral. Licença AGPL-3.0-or-later; sem garantia.\nCódigo-fonte: https://github.com/wbaamaral/rustpdf")
+    concat!("Uso: rustpdf-cli [--password-stdin] [--allow-unencrypted-output] COMANDO ...\n  rustpdf-cli info ENTRADA.pdf\n  rustpdf-cli new SAIDA.pdf\n  rustpdf-cli rotate ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli delete ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli append ENTRADA.pdf SAIDA.pdf OUTRO.pdf\n  rustpdf-cli blank-after ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli extract ENTRADA.pdf SAIDA.pdf PAGINA\n  rustpdf-cli png ENTRADA.pdf SAIDA.png PAGINA\n  rustpdf-cli text ENTRADA.pdf PAGINA\n  rustpdf-cli export ENTRADA.pdf SAIDA.{md,docx,pptx,odt,odg,csv,xlsx} [--paginas 1-3,7] [--para-ia] [--sem-imagens] [--quebrar-paginas] [--fiel] [--ocr IDIOMA] [--separador ;] [--sem-bom]\n  rustpdf-cli ocr ENTRADA.pdf PAGINAS [IDIOMA]\n  rustpdf-cli ocr-searchable ENTRADA.pdf SAIDA.pdf PAGINAS [IDIOMA] [--refazer]\n  rustpdf-cli fields ENTRADA.pdf\n  rustpdf-cli text-field ENTRADA.pdf SAIDA.pdf PAGINA NOME VALOR X Y LARGURA ALTURA [multiline]\n  rustpdf-cli set-field ENTRADA.pdf SAIDA.pdf NOME NOVO_VALOR\n  rustpdf-cli checkbox ENTRADA.pdf SAIDA.pdf PAGINA NOME SIM_OU_NAO X Y TAMANHO\n  rustpdf-cli set-checkbox ENTRADA.pdf SAIDA.pdf NOME SIM_OU_NAO\n  rustpdf-cli radio ENTRADA.pdf SAIDA.pdf PAGINA NOME SELECAO_OU_- \"op1,op2\" X Y TAMANHO ESPACO\n  rustpdf-cli set-radio ENTRADA.pdf SAIDA.pdf NOME SELECAO\n  rustpdf-cli choice ENTRADA.pdf SAIDA.pdf PAGINA NOME VALOR \"op1,op2\" X Y LARGURA ALTURA [combo|lista]\n  rustpdf-cli set-choice ENTRADA.pdf SAIDA.pdf NOME VALOR\n  rustpdf-cli text-runs ENTRADA.pdf PAGINA\n  rustpdf-cli replace-text ENTRADA.pdf SAIDA.pdf PAGINA ANTIGO NOVO\n  rustpdf-cli images ENTRADA.pdf PAGINA\n  rustpdf-cli image-draws ENTRADA.pdf PAGINA\n  rustpdf-cli replace-image ENTRADA.pdf SAIDA.pdf PAGINA NOME IMAGEM.png [N|todas]\n  rustpdf-cli replace-image-at ENTRADA.pdf SAIDA.pdf PAGINA X Y IMAGEM.png\n  rustpdf-cli move-image ENTRADA.pdf SAIDA.pdf PAGINA NOME DX DY [N|todas]\n  rustpdf-cli remove-image ENTRADA.pdf SAIDA.pdf PAGINA NOME [N|todas]\n  rustpdf-cli remove-image-at ENTRADA.pdf SAIDA.pdf PAGINA X Y\n  rustpdf-cli move-text ENTRADA.pdf SAIDA.pdf PAGINA X Y DX DY\n  rustpdf-cli edit-text-at ENTRADA.pdf SAIDA.pdf PAGINA X Y NOVO_TEXTO\n  rustpdf-cli select ENTRADA.pdf PAGINA X Y\n  rustpdf-cli move-object ENTRADA.pdf SAIDA.pdf PAGINA X Y DX DY\n  rustpdf-cli resize-object ENTRADA.pdf SAIDA.pdf PAGINA X Y FATOR_X FATOR_Y\n  rustpdf-cli rotate-object ENTRADA.pdf SAIDA.pdf PAGINA X Y GRAUS\n  rustpdf-cli transform-object ENTRADA.pdf SAIDA.pdf PAGINA X Y A B C D E F\n  rustpdf-cli note ENTRADA.pdf SAIDA.pdf PAGINA TEXTO\n  rustpdf-cli note-at ENTRADA.pdf SAIDA.pdf PAGINA TEXTO X Y\n  rustpdf-cli highlight-at ENTRADA.pdf SAIDA.pdf PAGINA X Y LARGURA ALTURA\n  rustpdf-cli insert-text ENTRADA.pdf SAIDA.pdf PAGINA TEXTO\n  rustpdf-cli insert-text-at ENTRADA.pdf SAIDA.pdf PAGINA TEXTO X Y TAMANHO_FONTE\n  rustpdf-cli insert-image ENTRADA.pdf SAIDA.pdf PAGINA IMAGEM.png\n  rustpdf-cli insert-image-at ENTRADA.pdf SAIDA.pdf PAGINA IMAGEM.png X Y LARGURA ALTURA\n  rustpdf-cli crop ENTRADA.pdf SAIDA.pdf PAGINA MARGEM_EM_PONTOS\n\nRustPDF ", env!("CARGO_PKG_VERSION"), " — Copyright (C) 2026 Welyqrson Bastos Amaral. Licença AGPL-3.0-or-later; sem garantia.\nPAGINAS: 3, 1-3,7 ou todas. O andamento sai na saída de erro.\nCódigo-fonte: https://github.com/wbaamaral/rustpdf")
 }
 
 fn parse_page(value: &str, count: usize) -> AppResult<usize> {
@@ -146,6 +150,12 @@ fn execute(args: &[String], password: Option<&str>, allow_unencrypted: bool) -> 
     if operation == "export" {
         return export(&args[2..], password);
     }
+    if operation == "ocr" {
+        return ocr(&args[2..], password);
+    }
+    if operation == "ocr-searchable" {
+        return ocr_searchable(&args[2..], password, allow_unencrypted);
+    }
     let mut session = if let Some(password) = password {
         PdfSession::open_with_password(input, password)?
     } else {
@@ -199,13 +209,6 @@ fn execute(args: &[String], password: Option<&str>, allow_unencrypted: bool) -> 
         "append" if args.len() == 5 => {
             session.append_pdf(Path::new(&args[4]))?;
             save_session(&mut session, Path::new(&args[3]), allow_unencrypted)?;
-        }
-        "ocr-searchable" if args.len() == 5 || args.len() == 6 => {
-            session.page = parse_page(&args[4], session.pages)?;
-            let language = args.get(5).map(String::as_str).unwrap_or("por+eng");
-            let words = session.ocr_searchable_current(language)?;
-            save_session(&mut session, Path::new(&args[3]), allow_unencrypted)?;
-            println!("{words} palavras reconhecidas");
         }
         "text-field" if args.len() == 11 || args.len() == 12 => {
             session.page = parse_page(&args[4], session.pages)?;
@@ -504,14 +507,9 @@ fn execute(args: &[String], password: Option<&str>, allow_unencrypted: bool) -> 
             session.set_checkbox_value(&args[4], parse_checkbox_state(&args[5])?)?;
             save_session(&mut session, Path::new(&args[3]), allow_unencrypted)?;
         }
-        "text" | "ocr" if args.len() == 4 => {
+        "text" if args.len() == 4 => {
             session.page = parse_page(&args[3], session.pages)?;
-            let text = if operation == "text" {
-                session.extract_text()?
-            } else {
-                session.ocr_current()?
-            };
-            print!("{text}");
+            print!("{}", session.extract_text()?);
         }
         _ => return Err(usage().into()),
     }
@@ -525,17 +523,107 @@ fn export(args: &[String], password: Option<&str>) -> AppResult<()> {
         Some(password) => PdfSession::open_with_password(&command.input, password)?,
         None => PdfSession::open(&command.input)?,
     };
+    let progress = StderrProgress::new();
+    let format = command.request.format;
     let written = export_to_files(
         session.work_path(),
         session.pages,
         &command.request,
-        &|_, _| true,
+        &|done, total| {
+            progress.show(&cli_progress_message(format, done, total));
+            true
+        },
     )?;
+    progress.finish();
     if command.request.format == ExportFormat::Csv {
         for path in written {
             println!("{}", path.display());
         }
     }
+    Ok(())
+}
+
+/// Andamento na saída de erro: no terminal, uma linha reescrita; em arquivo
+/// ou pipe, uma linha por passo. A saída padrão fica só com o resultado.
+struct StderrProgress {
+    terminal: bool,
+    open: Cell<bool>,
+}
+
+impl StderrProgress {
+    fn new() -> Self {
+        Self {
+            terminal: std::io::stderr().is_terminal(),
+            open: Cell::new(false),
+        }
+    }
+
+    fn show(&self, message: &str) {
+        if self.terminal {
+            eprint!("\r{message}\x1b[K");
+            self.open.set(true);
+        } else {
+            eprintln!("{message}");
+        }
+    }
+
+    /// Termina a linha reescrita (sem efeito fora do terminal).
+    fn finish(&self) {
+        if self.open.replace(false) {
+            eprintln!();
+        }
+    }
+}
+
+impl Drop for StderrProgress {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn open_session(input: &Path, password: Option<&str>) -> AppResult<PdfSession> {
+    match password {
+        Some(password) => PdfSession::open_with_password(input, password),
+        None => PdfSession::open(input),
+    }
+}
+
+/// `ocr ENTRADA PAGINAS [IDIOMA]`: texto de cada página, separado por
+/// quebra de página (form feed) como no pdftotext.
+fn ocr(args: &[String], password: Option<&str>) -> AppResult<()> {
+    let command = parse_ocr(args)?;
+    let session = open_session(&command.input, password)?;
+    let pages = ocr_texts::pages(&command.pages, session.pages)?;
+    let progress = StderrProgress::new();
+    let texts = session.ocr_text(&pages, command.language.as_deref(), &|done, total| {
+        if done < total {
+            progress.show(&ocr_texts::progress_message(done, total));
+        }
+        true
+    })?;
+    progress.finish();
+    print!("{}", texts.join("\x0c"));
+    Ok(())
+}
+
+/// `ocr-searchable ENTRADA SAIDA PAGINAS [IDIOMA] [--refazer]`.
+fn ocr_searchable(
+    args: &[String],
+    password: Option<&str>,
+    allow_unencrypted: bool,
+) -> AppResult<()> {
+    let command = parse_ocr_searchable(args)?;
+    let mut session = open_session(&command.input, password)?;
+    let pages = ocr_texts::pages(&command.pages, session.pages)?;
+    let progress = StderrProgress::new();
+    let summary =
+        session.ocr_searchable(&pages, &command.language, command.redo, &|done, total| {
+            progress.show(&ocr_texts::progress_message(done, total));
+            true
+        })?;
+    progress.finish();
+    save_session(&mut session, &command.output, allow_unencrypted)?;
+    println!("{}", ocr_texts::summary_message(&summary));
     Ok(())
 }
 

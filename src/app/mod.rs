@@ -4,4 +4,5 @@
 #![forbid(unsafe_code)]
 pub mod erros;
 pub mod exportar;
+pub mod ocr;
 pub mod portas;

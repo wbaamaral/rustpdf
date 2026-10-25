@@ -21,7 +21,9 @@ pub mod textmove;
 pub mod testkit;
 
 pub use annotations::{AnnotationInfo, FieldInfo, FieldKind};
-use app::portas::{LayoutSource, OcrEngine, Renderer};
+use app::ocr::OcrSources;
+pub use app::ocr::{OcrSummary, PageOcr, PageOutcome};
+use app::portas::{LayoutSource, Renderer};
 pub use content::{
     ImageEditOutcome, ImageInfo, ImagePlacement, ImageTarget, Occurrence, TextEditOutcome,
 };
@@ -2192,38 +2194,101 @@ impl PdfSession {
         Ok(Poppler.text(&self.work, self.page)?)
     }
 
-    pub fn ocr_current(&self) -> AppResult<String> {
-        let rendered = self.render(2400)?;
-        let png = fs::read(&rendered).map_err(|e| format!("OCR: {e}"))?;
-        Ok(Tesseract.text(&png, None)?)
+    /// Portas reais do OCR (poppler e Tesseract).
+    pub fn ocr_sources() -> OcrSources<'static> {
+        OcrSources {
+            layout: &Poppler,
+            renderer: &Poppler,
+            engine: &Tesseract,
+        }
     }
 
-    pub fn ocr_searchable_current(&mut self, language: &str) -> AppResult<usize> {
-        if language.is_empty()
-            || !language
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '_' | '-'))
-        {
-            return Err("Código de idioma OCR inválido".into());
+    /// Texto reconhecido da página atual (idioma padrão do Tesseract).
+    pub fn ocr_current(&self) -> AppResult<String> {
+        let pages = PageRange::parse(&self.page.to_string(), self.pages)?;
+        let mut texts = self.ocr_text(&pages, None, &|_, _| true)?;
+        Ok(texts.pop().unwrap_or_default())
+    }
+
+    /// Texto reconhecido de cada página de `pages`, na ordem.
+    pub fn ocr_text(
+        &self,
+        pages: &PageRange,
+        language: Option<&str>,
+        progress: app::ocr::Progress,
+    ) -> AppResult<Vec<String>> {
+        Ok(app::ocr::read_text(
+            &Self::ocr_sources(),
+            &self.work,
+            pages,
+            language,
+            progress,
+        )?)
+    }
+
+    /// OCR pesquisável das `pages` (as que já têm texto só com `redo`),
+    /// aplicado como uma única edição.
+    pub fn ocr_searchable(
+        &mut self,
+        pages: &PageRange,
+        language: &str,
+        redo: bool,
+        progress: app::ocr::Progress,
+    ) -> AppResult<OcrSummary> {
+        let results = app::ocr::recognize(
+            &Self::ocr_sources(),
+            &self.work,
+            pages,
+            language,
+            redo,
+            progress,
+        )?;
+        self.apply_ocr_layer(&results)
+    }
+
+    /// Sobrepõe a camada de texto invisível das páginas reconhecidas (por
+    /// `ocr_searchable` ou por uma tarefa sobre uma cópia deste documento)
+    /// num só `qpdf`: um único Desfazer remove tudo. Sem páginas
+    /// reconhecidas, o documento não muda.
+    pub fn apply_ocr_layer(&mut self, results: &[PageOcr]) -> AppResult<OcrSummary> {
+        let summary = OcrSummary::of(results);
+        let recognized: Vec<(usize, &dominio::layout::Page)> = results
+            .iter()
+            .filter_map(|result| match &result.outcome {
+                PageOutcome::Recognized(layout) => Some((result.page, layout)),
+                _ => None,
+            })
+            .collect();
+        if recognized.is_empty() {
+            return Ok(summary);
         }
-        let (width, height) = self.current_page_size()?;
-        let rendered = self.render(2400)?;
-        let png = fs::read(&rendered).map_err(|e| format!("OCR: {e}"))?;
-        let recognized = Tesseract.words(&png, language)?;
+        if let Some((page, _)) = recognized.iter().find(|(page, _)| *page > self.pages) {
+            return Err(format!("OCR: a página {page} não existe mais no documento"));
+        }
         let overlay = self.work_dir.join("ocr-overlay.pdf");
         let next = self.work_dir.join("next.pdf");
-        let words = ocr::write_searchable_overlay(&recognized, &overlay, width, height)?;
+        let layouts: Vec<&dominio::layout::Page> =
+            recognized.iter().map(|(_, layout)| *layout).collect();
+        ocr::write_searchable_overlay(&layouts, &overlay)?;
+        let targets: Vec<String> = recognized
+            .iter()
+            .map(|(page, _)| page.to_string())
+            .collect();
         let result = self.apply_qpdf(&[
             self.work.as_os_str().to_owned(),
             OsString::from("--overlay"),
             overlay.as_os_str().to_owned(),
-            OsString::from(format!("--to={}", self.page)),
+            OsString::from(format!("--to={}", targets.join(","))),
             OsString::from("--"),
             next.as_os_str().to_owned(),
         ]);
         let _ = fs::remove_file(overlay);
         result?;
-        Ok(words)
+        // O histórico registra a página atual; outra página ou várias = mudança global.
+        if recognized.len() > 1 || recognized[0].0 != self.page {
+            self.mark_global_change();
+        }
+        Ok(summary)
     }
 
     /// Salva; PDF protegido mantém a criptografia (senhas e permissões) do original.
@@ -2573,29 +2638,156 @@ mod tests {
         drop(session);
     }
 
+    /// PDF de uma página só com a imagem de `text` impresso (sem texto).
+    fn scanned_page(root: &Path, name: &str, text: &str) -> PathBuf {
+        let blank = root.join("blank.pdf");
+        if !blank.exists() {
+            create_blank_pdf(&blank).unwrap();
+        }
+        let image = root.join(format!("{name}.png"));
+        let mut printed = PdfSession::open(&blank).unwrap();
+        printed.insert_visible_text(text).unwrap();
+        printed.export_png(&image).unwrap();
+        drop(printed);
+        let mut scanned = PdfSession::open(&blank).unwrap();
+        scanned.insert_image(&image).unwrap();
+        let output = root.join(format!("{name}.pdf"));
+        scanned.save_as(&output).unwrap();
+        output
+    }
+
+    fn page_text(session: &PdfSession, page: usize) -> String {
+        Poppler.text(&session.work, page).unwrap()
+    }
+
+    fn all_pages(_: usize, _: usize) -> bool {
+        true
+    }
+
     #[test]
     fn ocr_adds_searchable_text_without_changing_page_pixels() {
         let dir = crate::testkit::TempDir::new("ocr-test");
-        let root = dir.path().to_path_buf();
-        let blank = root.join("blank.pdf");
-        let image = root.join("printed-page.png");
-        create_blank_pdf(&blank).unwrap();
-        let mut printed = PdfSession::open(&blank).unwrap();
-        printed.insert_visible_text("SEARCHABLE OCR TEST").unwrap();
-        printed.export_png(&image).unwrap();
-        drop(printed);
-
-        let mut scanned = PdfSession::open(&blank).unwrap();
-        scanned.insert_image(&image).unwrap();
+        let scanned_pdf = scanned_page(dir.path(), "scanned", "SEARCHABLE OCR TEST");
+        let mut scanned = PdfSession::open(&scanned_pdf).unwrap();
         assert!(scanned.extract_text().unwrap().trim().is_empty());
         let pixels_before = fs::read(scanned.render(800).unwrap()).unwrap();
-        assert_eq!(scanned.ocr_searchable_current("eng").unwrap(), 3);
+        let current = PageRange::parse("1", 1).unwrap();
+        let summary = scanned
+            .ocr_searchable(&current, "eng", false, &all_pages)
+            .unwrap();
+        assert_eq!((summary.recognized, summary.words), (1, 3));
         assert!(scanned.extract_text().unwrap().contains("SEARCHABLE"));
         let pixels_after = fs::read(scanned.render(800).unwrap()).unwrap();
         assert_eq!(pixels_before, pixels_after);
+        // A página agora tem texto: sem `redo`, não é reconhecida de novo.
+        let again = scanned
+            .ocr_searchable(&current, "eng", false, &all_pages)
+            .unwrap();
+        assert_eq!((again.recognized, again.had_text), (0, 1));
+        assert_eq!(
+            scanned
+                .extract_text()
+                .unwrap()
+                .matches("SEARCHABLE")
+                .count(),
+            1
+        );
         scanned.undo().unwrap();
         assert!(scanned.extract_text().unwrap().trim().is_empty());
         drop(scanned);
+    }
+
+    #[test]
+    fn ocr_runs_through_the_whole_document_as_one_edit() {
+        let dir = crate::testkit::TempDir::new("ocr-documento");
+        let first = scanned_page(dir.path(), "primeira", "FIRST SCANNED PAGE");
+        let last = scanned_page(dir.path(), "ultima", "LAST SCANNED PAGE");
+        let digital = dir.join("digital.pdf");
+        create_blank_pdf(&digital).unwrap();
+        let mut text_page = PdfSession::open(&digital).unwrap();
+        text_page.insert_visible_text("Digital text").unwrap();
+        text_page.save_as(&digital).unwrap();
+        drop(text_page);
+
+        let mut session = PdfSession::open(&first).unwrap();
+        session.append_pdf(&digital).unwrap();
+        session.append_pdf(&last).unwrap();
+        assert_eq!(session.pages, 3);
+        let before = session.past.len();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let progress = |done: usize, total: usize| {
+            seen.borrow_mut().push((done, total));
+            true
+        };
+        let summary = session
+            .ocr_searchable(&PageRange::all(3), "eng", false, &progress)
+            .unwrap();
+        assert_eq!((summary.recognized, summary.had_text), (2, 1));
+        assert_eq!(seen.into_inner(), [(0, 3), (1, 3), (2, 3), (3, 3)]);
+        assert!(page_text(&session, 1).contains("FIRST"));
+        assert!(page_text(&session, 3).contains("LAST"));
+        assert_eq!(
+            page_text(&session, 2).trim(),
+            "Digital text",
+            "sem camada duplicada"
+        );
+        assert_eq!(session.past.len(), before + 1, "uma única edição");
+        let check = tool_command("qpdf")
+            .arg("--check")
+            .arg(&session.work)
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stdout)
+        );
+        session.undo().unwrap();
+        assert!(page_text(&session, 1).trim().is_empty());
+        assert!(page_text(&session, 3).trim().is_empty());
+    }
+
+    #[test]
+    fn ocr_layer_from_a_background_copy_is_applied_later() {
+        let dir = crate::testkit::TempDir::new("ocr-copia");
+        let scanned_pdf = scanned_page(dir.path(), "copia", "BACKGROUND OCR WORKS");
+        let mut session = PdfSession::open(&scanned_pdf).unwrap();
+        session.insert_blank_after().unwrap();
+        session.page = 2;
+        let copy = session.export_snapshot().unwrap();
+        let results = app::ocr::recognize(
+            &PdfSession::ocr_sources(),
+            &copy,
+            &PageRange::all(2),
+            "eng",
+            false,
+            &all_pages,
+        )
+        .unwrap();
+        assert_eq!(results[1].outcome, PageOutcome::NoWords, "página em branco");
+        let summary = session.apply_ocr_layer(&results).unwrap();
+        assert_eq!((summary.recognized, summary.no_words), (1, 1));
+        assert!(page_text(&session, 1).contains("BACKGROUND"));
+        assert_eq!(session.page, 2, "continua na página em que estava");
+        // Nada reconhecido: o documento não muda.
+        let revision = session.revision();
+        assert_eq!(
+            session.apply_ocr_layer(&results[1..]).unwrap().recognized,
+            0
+        );
+        assert_eq!(session.revision(), revision);
+        // Resultado de uma página que não existe mais é recusado.
+        session.delete_current().unwrap();
+        session.delete_current().unwrap_err();
+        assert_eq!(session.pages, 1);
+        let stale = [PageOcr {
+            page: 2,
+            outcome: results[0].outcome.clone(),
+        }];
+        assert_eq!(
+            session.apply_ocr_layer(&stale).unwrap_err(),
+            "OCR: a página 2 não existe mais no documento"
+        );
     }
 
     #[test]
